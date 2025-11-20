@@ -1,0 +1,91 @@
+cymbal_splash:
+  class_id: 0
+  pitches: [43, 83]  # G2, B5 (hit, choke)
+
+hi_hat_closed:
+  class_id: 1
+  pitches: [54]  # F#1
+
+hi_hat_open_1:
+  class_id: 2
+  pitches: [80]  # G#5
+
+hi_hat_open_2:
+  class_id: 3
+  pitches: [46]  # A#1
+
+hi_hat_pedal:
+  class_id: 4
+  pitches: [56]  # G#1 (pedal close foot)
+
+kick_left:
+  class_id: 5
+  pitches: [23]  # B0
+
+kick_center:
+  class_id: 6
+  pitches: [24]  # C1
+
+racktom_1:
+  class_id: 7
+  pitches: [36]  # C2
+
+racktom_2:
+  class_id: 8
+  pitches: [35]  # B1
+
+racktom_3:
+  class_id: 9
+  pitches: [33]  # A1
+
+racktom_4:
+  class_id: 10
+  pitches: [43]  # G1
+
+floortom_1:
+  class_id: 11
+  pitches: [38]  # D2
+
+floortom_2:
+  class_id: 12
+  pitches: [41]  # F1
+
+cymbal_china:
+  class_id: 13
+  pitches: [49, 84]  # E2, C6 (hit, choke)
+
+cymbal_crash_1:
+  class_id: 14
+  pitches: [49, 49]  # C#2, C#6 (hit, choke)
+
+cymbal_crash_2:
+  class_id: 15
+  pitches: [45, 50]  # A2, D6 (hit, choke)
+
+ride_1_bell:
+  class_id: 16
+  pitches: [53, 108]  # F2, G8
+
+ride_1_bow:
+  class_id: 17
+  pitches: [51, 102]  # D#2, F#8
+
+ride_1_edge:
+  class_id: 18
+  pitches: [59, 81]  # B2, A5
+
+ride_1_choke:
+  class_id: 19
+  pitches: [82]  # A#5 (mute/choke)
+
+snare_hit:
+  class_id: 20
+  pitches: [38]  # D1
+
+snare_rimshot:
+  class_id: 21
+  pitches: [80]  # G5
+
+snare_sidestick:
+  class_id: 22
+  pitches: [31, 25]  # G0, C#1
