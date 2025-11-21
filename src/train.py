@@ -6,7 +6,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from dataset import get_dataset  # must return Dataset
+from dataset import DrumDataset
 from model import DrumTransformer
 from tqdm import tqdm
 from contextlib import nullcontext
@@ -165,8 +165,9 @@ def main(args):
     print("Using device:", device)
 
     # ---- datasets ----
-    train_dataset = get_dataset(args.train_dir, seq_len=args.seq_len)
-    val_dataset = get_dataset(args.val_dir, seq_len=args.seq_len)
+    train_dataset = DrumDataset(args.train_dir, seq_len=args.seq_len, augment=True)
+    val_dataset = DrumDataset(args.val_dir, seq_len=args.seq_len, augment=False)
+
 
     # ---- samplers / dataloaders ----
     if num_gpus > 1:
