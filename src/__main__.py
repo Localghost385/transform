@@ -48,7 +48,7 @@ def main():
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision")
     train_parser.add_argument("--use_compile", action="store_true", help="Enable torch.compile()")
     train_parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
-    train_parser.add_argument("--num_workers", type=int, default=4)
+    train_parser.add_argument("--num_workers", type=int, default=2)
     train_parser.add_argument("--num_threads", type=int, default=4)
 
     # LR warmup

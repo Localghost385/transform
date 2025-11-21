@@ -94,9 +94,16 @@ def train_epoch(
     global_step = start_step
 
     # choose autocast dtype for CPU/GPU
-    autocast_ctx = torch.cuda.amp.autocast if (use_amp and device.type == "cuda") else (
-        (lambda *a, **k: torch.autocast("cpu", dtype=torch.bfloat16)) if use_amp and device.type == "cpu" and hasattr(torch, "autocast") else (lambda *a, **k: torch.noop())
-    )
+    from contextlib import nullcontext
+
+    if use_amp:
+        if device.type == "cuda":
+            autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16)
+        else:
+            autocast_ctx = lambda: torch.autocast("cpu", dtype=torch.bfloat16)
+    else:
+        autocast_ctx = nullcontext  # no-op context manager
+
 
     optimizer.zero_grad()
     pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=prog_desc)
@@ -141,9 +148,16 @@ def eval_epoch(model, dataloader, device, use_amp=True):
     total_tokens = 0
     with torch.no_grad():
         # use same autocast behavior as training for consistent perf
-        autocast_ctx = torch.cuda.amp.autocast if (use_amp and device.type == "cuda") else (
-            (lambda *a, **k: torch.autocast("cpu", dtype=torch.bfloat16)) if use_amp and device.type == "cpu" and hasattr(torch, "autocast") else (lambda *a, **k: torch.noop())
-        )
+        from contextlib import nullcontext
+
+        if use_amp:
+            if device.type == "cuda":
+                autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16)
+            else:
+                autocast_ctx = lambda: torch.autocast("cpu", dtype=torch.bfloat16)
+        else:
+            autocast_ctx = nullcontext  # no-op context manager
+
         pbar = tqdm(dataloader, desc="Validation", total=len(dataloader))
         for x, y in pbar:
             x = x.to(device)
