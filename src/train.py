@@ -165,7 +165,7 @@ def eval_epoch(model, dataloader, device, use_amp=True):
             y = y.to(device, non_blocking=True)
             with autocast_ctx():
                 preds = model(x)
-                loss = model.compute_loss(preds, y)
+                loss = (model.module.compute_loss(preds, y) if hasattr(model, "module") else model.compute_loss(preds, y))
             batch_n = x.size(0)
             total_loss += loss.item() * batch_n
             total_tokens += batch_n
