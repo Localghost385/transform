@@ -119,7 +119,7 @@ def train_epoch(model, dataloader, optimizer, scaler, device, scheduler=None,
         y = y.to(device, non_blocking=True)
         with autocast_ctx():
             preds = model(x)
-            loss = model.compute_loss(preds, y) / grad_accum
+            loss = model.compute_loss(preds, y) / grad_accumloss = (model.module.compute_loss(preds, y) if hasattr(model, "module") else model.compute_loss(preds, y)) / grad_accum
 
         if scaler is not None:
             scaler.scale(loss).backward()
