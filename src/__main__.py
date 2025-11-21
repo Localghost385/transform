@@ -43,6 +43,7 @@ def main():
     train_parser.add_argument("--lr", type=float, default=1e-4)
     train_parser.add_argument("--weight_decay", type=float, default=0.01)
     train_parser.add_argument("--clip_grad", type=float, default=1.0)
+    train_parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
 
     # Performance settings
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision")
