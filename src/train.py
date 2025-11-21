@@ -2,7 +2,8 @@ import os
 import time
 import math
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from dataset import get_dataloader
@@ -13,46 +14,44 @@ from tqdm import tqdm
 # Helper utilities
 # -------------------------
 def setup_device_and_perf(args):
-    device = torch.device(args.device if torch.cuda.is_available() and "cuda" in args.device else "cpu")
-
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_type)
+    
     # CPU / GPU tuning
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-        # allow TF32 if available (works on Ampere+)
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
         except Exception:
             pass
     else:
-        # Improve CPU throughput
         if hasattr(torch, "set_num_threads"):
             torch.set_num_threads(args.num_threads)
             torch.set_num_interop_threads(args.num_threads)
-
     return device
 
 def build_optimizer(model, lr, weight_decay=0.01):
-    # pick sensible defaults for transformers
     return AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95), eps=1e-8)
 
 def build_scheduler_with_warmup(optimizer, warmup_steps, total_steps):
-    """
-    Return a LambdaLR that does linear warmup then cosine decay to zero.
-    """
     def lr_lambda(step):
         if step < warmup_steps and warmup_steps > 0:
             return float(step) / float(max(1, warmup_steps))
-        # cosine decay after warmup
         progress = float(max(0, step - warmup_steps)) / float(max(1, total_steps - warmup_steps))
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return LambdaLR(optimizer, lr_lambda)
 
 def save_checkpoint(path, model, optimizer, scaler, scheduler, epoch, step, is_best=False):
+    if hasattr(model, "module"):  # unwrap DDP
+        state_dict = model.module.state_dict()
+    else:
+        state_dict = model.state_dict()
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
     ckpt = {
         "epoch": epoch,
         "global_step": step,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": state_dict,
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
@@ -64,18 +63,18 @@ def save_checkpoint(path, model, optimizer, scaler, scheduler, epoch, step, is_b
         torch.save(ckpt, best_path)
 
 def maybe_load_checkpoint(resume_path, model, optimizer=None, scaler=None, scheduler=None, map_location="cpu"):
-    """
-    Load checkpoint if exists. Returns (start_epoch, global_step, loaded_flag)
-    """
     if resume_path is None or not os.path.exists(resume_path):
         return 0, 0, False
     ckpt = torch.load(resume_path, map_location=map_location)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    if optimizer is not None and "optimizer_state_dict" in ckpt and ckpt["optimizer_state_dict"] is not None:
+    if hasattr(model, "module"):
+        model.module.load_state_dict(ckpt["model_state_dict"], strict=False)
+    else:
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    if scaler is not None and "scaler_state_dict" in ckpt and ckpt["scaler_state_dict"] is not None:
+    if scaler is not None and "scaler_state_dict" in ckpt:
         scaler.load_state_dict(ckpt["scaler_state_dict"])
-    if scheduler is not None and "scheduler_state_dict" in ckpt and ckpt["scheduler_state_dict"] is not None:
+    if scheduler is not None and "scheduler_state_dict" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     start_epoch = ckpt.get("epoch", 0)
     global_step = ckpt.get("global_step", 0)
@@ -84,26 +83,17 @@ def maybe_load_checkpoint(resume_path, model, optimizer=None, scaler=None, sched
 # -------------------------
 # Training / Eval loops
 # -------------------------
-def train_epoch(
-    model, dataloader, optimizer, scaler, device, scheduler=None,
-    clip_grad=1.0, grad_accum=1, use_amp=True, prog_desc="Training", start_step=0
-):
+def train_epoch(model, dataloader, optimizer, scaler, device, scheduler=None,
+                clip_grad=1.0, grad_accum=1, use_amp=True, prog_desc="Training", start_step=0):
     model.train()
     total_loss = 0.0
     total_tokens = 0
     global_step = start_step
 
-    # choose autocast dtype for CPU/GPU
     from contextlib import nullcontext
-
+    autocast_ctx = nullcontext
     if use_amp:
-        if device.type == "cuda":
-            autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16)
-        else:
-            autocast_ctx = lambda: torch.autocast("cpu", dtype=torch.bfloat16)
-    else:
-        autocast_ctx = nullcontext  # no-op context manager
-
+        autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16) if device.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16)
 
     optimizer.zero_grad()
     pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=prog_desc)
@@ -133,9 +123,8 @@ def train_epoch(
             optimizer.zero_grad()
             global_step += 1
 
-        # bookkeeping
         batch_n = x.size(0)
-        total_loss += loss.item() * batch_n * grad_accum  # loss was scaled down earlier
+        total_loss += loss.item() * batch_n * grad_accum
         total_tokens += batch_n
         avg_loss = total_loss / max(1, total_tokens)
         pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}", "step": global_step})
@@ -146,18 +135,12 @@ def eval_epoch(model, dataloader, device, use_amp=True):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+    from contextlib import nullcontext
+    autocast_ctx = nullcontext
+    if use_amp:
+        autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16) if device.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16)
+
     with torch.no_grad():
-        # use same autocast behavior as training for consistent perf
-        from contextlib import nullcontext
-
-        if use_amp:
-            if device.type == "cuda":
-                autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16)
-            else:
-                autocast_ctx = lambda: torch.autocast("cpu", dtype=torch.bfloat16)
-        else:
-            autocast_ctx = nullcontext  # no-op context manager
-
         pbar = tqdm(dataloader, desc="Validation", total=len(dataloader))
         for x, y in pbar:
             x = x.to(device)
@@ -173,33 +156,28 @@ def eval_epoch(model, dataloader, device, use_amp=True):
     return avg_loss
 
 # -------------------------
-# Main training entry (args-driven)
+# Main training entry
 # -------------------------
 def main(args):
-    """
-    args should provide:
-      - train_dir, val_dir
-      - num_classes, seq_len, d_model, nhead, num_layers, ff_dim, dropout
-      - batch_size, epochs, lr, clip_grad, checkpoint_dir
-      - device (e.g., "cuda" or "cpu"), num_workers, num_threads
-      - grad_accum, warmup_steps (or warmup_ratio), use_amp (bool), use_compile (bool)
-      - save_every_steps (int), resume_from (path or None)
-    """
-    # ---- perf / device setup ----
+    # ---- detect GPUs ----
+    num_gpus = torch.cuda.device_count()
+    print(f"Detected {num_gpus} GPUs.")
+
     device = setup_device_and_perf(args)
     print("Using device:", device)
 
     # ---- dataloaders ----
-    dl_kwargs = dict(
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        shuffle=True,
-        augment=False,
-        num_workers=args.num_workers
-    )
-    # get_dataloader constructs dataset internally; ensure persistent_workers on PyTorch >=1.7
-    train_loader = get_dataloader(args.train_dir, seq_len=args.seq_len, batch_size=args.batch_size, shuffle=True, augment=False, num_workers=args.num_workers)
-    val_loader = get_dataloader(args.val_dir, seq_len=args.seq_len, batch_size=args.batch_size, shuffle=False, augment=False, num_workers=max(0, args.num_workers//2))
+    train_dataset = get_dataloader(args.train_dir, seq_len=args.seq_len, batch_size=args.batch_size, shuffle=True, augment=False, num_workers=args.num_workers)
+    val_dataset = get_dataloader(args.val_dir, seq_len=args.seq_len, batch_size=args.batch_size, shuffle=False, augment=False, num_workers=max(0, args.num_workers//2))
+
+    if num_gpus > 1:
+        train_sampler = DistributedSampler(train_dataset)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=args.num_workers)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=max(0, args.num_workers//2))
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=max(0, args.num_workers//2))
 
     steps_per_epoch = max(1, math.ceil(len(train_loader.dataset) / args.batch_size / max(1, args.grad_accum)))
     total_steps = steps_per_epoch * args.epochs
@@ -223,21 +201,18 @@ def main(args):
         except Exception as e:
             print("torch.compile failed:", e)
 
+    # ---- multi-GPU ----
+    if num_gpus > 1:
+        print("Wrapping model with DistributedDataParallel (DDP)")
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=list(range(num_gpus)))
+
     print(f"Model parameters: {model.count_parameters():,}")
 
     # ---- optimizer / scaler / scheduler ----
-    optimizer = build_optimizer(model, lr=args.lr, weight_decay=args.weight_decay if hasattr(args, "weight_decay") else 0.01)
+    optimizer = build_optimizer(model, lr=args.lr, weight_decay=getattr(args, "weight_decay", 0.01))
+    scaler = torch.cuda.amp.GradScaler() if (device.type == "cuda" and args.use_amp) else None
 
-    scaler = torch.cuda.amp.GradScaler() if (device.type == "cuda" and args.use_amp) else (
-        torch.cuda.amp.GradScaler() if (device.type == "cpu" and args.use_amp and getattr(torch.cuda.amp, "GradScaler", None) is not None) else None
-    )
-
-    # Compute warmup steps (allow warmup_ratio)
-    if getattr(args, "warmup_steps", None) is None and getattr(args, "warmup_ratio", None) is not None:
-        warmup_steps = int(total_steps * args.warmup_ratio)
-    else:
-        warmup_steps = int(getattr(args, "warmup_steps", 100))
-
+    warmup_steps = int(total_steps * getattr(args, "warmup_ratio", 0.03)) if getattr(args, "warmup_steps", None) is None else int(getattr(args, "warmup_steps", 100))
     scheduler = build_scheduler_with_warmup(optimizer, warmup_steps=warmup_steps, total_steps=max(1, total_steps))
 
     # ---- resume support ----
@@ -256,6 +231,8 @@ def main(args):
 
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"\n=== Epoch {epoch}/{args.epochs} ===")
+        if num_gpus > 1:
+            train_sampler.set_epoch(epoch)  # shuffle correctly per epoch
 
         # Train
         train_loss, global_step = train_epoch(
@@ -274,20 +251,15 @@ def main(args):
 
         print(f"Epoch {epoch} train loss: {train_loss:.6f} (global_step={global_step})")
 
-        # Periodic checkpointing by step
-        if args.save_every_steps and args.save_every_steps > 0:
-            if global_step % args.save_every_steps == 0:
-                step_checkpoint = os.path.join(args.checkpoint_dir, f"checkpoint_step_{global_step}.pt")
-                save_checkpoint(step_checkpoint, model, optimizer, scaler, scheduler, epoch, global_step)
-                print("Saved step checkpoint:", step_checkpoint)
+        # Periodic checkpointing
+        if args.save_every_steps and args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+            step_ckpt = os.path.join(args.checkpoint_dir, f"checkpoint_step_{global_step}.pt")
+            save_checkpoint(step_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
+            print("Saved step checkpoint:", step_ckpt)
 
         # Evaluate
         val_loss = eval_epoch(model, val_loader, device, use_amp=args.use_amp)
         print(f"Epoch {epoch} validation loss: {val_loss:.6f}")
-
-        # Scheduler already stepped each optimizer.step() if scheduler provided and used that way;
-        # If you prefer per-epoch stepping, uncomment:
-        # scheduler.step()
 
         # Save epoch checkpoint and best model
         epoch_ckpt = os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt")

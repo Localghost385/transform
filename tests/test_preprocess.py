@@ -41,8 +41,8 @@ def simple_midi_file():
     track = mido.MidiTrack()
     mid.tracks.append(track)
     # add note_on messages for channel 9 (drums)
-    track.append(mido.Message('note_on', channel=9, note=36, velocity=100, time=0))
-    track.append(mido.Message('note_on', channel=9, note=38, velocity=100, time=480))
+    track.append(mido.Message('note_on', channel=0, note=36, velocity=100, time=0))
+    track.append(mido.Message('note_on', channel=0, note=38, velocity=100, time=480))
     
     fd, path = tempfile.mkstemp(suffix=".mid")
     os.close(fd)
@@ -106,7 +106,7 @@ def test_quantize_notes():
 def test_notes_to_multi_hot():
     quantized_notes = [(0, 36, 100), (1, 38, 100)]
     pitch_to_class = {36: 0, 38: 1}
-    X = notes_to_multi_hot(quantized_notes, num_classes=2, pitch_to_class=pitch_to_class)
+    X = notes_to_multi_hot(quantized_notes, pitch_to_class)
     assert X.shape == (2, 2)
     assert X[0, 0] == 1
     assert X[1, 1] == 1
