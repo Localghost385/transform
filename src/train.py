@@ -214,7 +214,10 @@ def main(args):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
-    print(f"Model parameters: {model.count_parameters():,}")
+    if hasattr(model, "module"):
+        print(f"Model parameters: {model.module.count_parameters():,}")
+    else:
+        print(f"Model parameters: {model.count_parameters():,}")
 
     # ---- optimizer / scaler / scheduler ----
     optimizer = build_optimizer(model, lr=args.lr, weight_decay=getattr(args, "weight_decay", 0.01))
