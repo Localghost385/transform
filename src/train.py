@@ -9,6 +9,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from dataset import get_dataloader
 from model import DrumTransformer
 from tqdm import tqdm
+from contextlib import nullcontext
 
 # -------------------------
 # Helper utilities
@@ -16,7 +17,7 @@ from tqdm import tqdm
 def setup_device_and_perf(args):
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_type)
-    
+
     # CPU / GPU tuning
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -90,7 +91,6 @@ def train_epoch(model, dataloader, optimizer, scaler, device, scheduler=None,
     total_tokens = 0
     global_step = start_step
 
-    from contextlib import nullcontext
     autocast_ctx = nullcontext
     if use_amp:
         autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16) if device.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16)
@@ -135,7 +135,6 @@ def eval_epoch(model, dataloader, device, use_amp=True):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
-    from contextlib import nullcontext
     autocast_ctx = nullcontext
     if use_amp:
         autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16) if device.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16)
@@ -163,10 +162,18 @@ def main(args):
     num_gpus = torch.cuda.device_count()
     print(f"Detected {num_gpus} GPUs.")
 
-    device = setup_device_and_perf(args)
+    # ---- distributed initialization ----
+    if num_gpus > 1:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        device = torch.device("cuda", local_rank)
+    else:
+        device = setup_device_and_perf(args)
+
     print("Using device:", device)
 
-    # ---- dataloaders ----
+    # ---- datasets and dataloaders ----
     train_dataset = get_dataloader(args.train_dir, seq_len=args.seq_len, batch_size=args.batch_size, shuffle=True, augment=False, num_workers=args.num_workers)
     val_dataset = get_dataloader(args.val_dir, seq_len=args.seq_len, batch_size=args.batch_size, shuffle=False, augment=False, num_workers=max(0, args.num_workers//2))
 
@@ -201,10 +208,11 @@ def main(args):
         except Exception as e:
             print("torch.compile failed:", e)
 
-    # ---- multi-GPU ----
+    # ---- multi-GPU DDP ----
     if num_gpus > 1:
         print("Wrapping model with DistributedDataParallel (DDP)")
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=list(range(num_gpus)))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
     print(f"Model parameters: {model.count_parameters():,}")
 
@@ -232,9 +240,8 @@ def main(args):
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"\n=== Epoch {epoch}/{args.epochs} ===")
         if num_gpus > 1:
-            train_sampler.set_epoch(epoch)  # shuffle correctly per epoch
+            train_sampler.set_epoch(epoch)
 
-        # Train
         train_loss, global_step = train_epoch(
             model=model,
             dataloader=train_loader,
@@ -251,17 +258,14 @@ def main(args):
 
         print(f"Epoch {epoch} train loss: {train_loss:.6f} (global_step={global_step})")
 
-        # Periodic checkpointing
         if args.save_every_steps and args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
             step_ckpt = os.path.join(args.checkpoint_dir, f"checkpoint_step_{global_step}.pt")
             save_checkpoint(step_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
             print("Saved step checkpoint:", step_ckpt)
 
-        # Evaluate
         val_loss = eval_epoch(model, val_loader, device, use_amp=args.use_amp)
         print(f"Epoch {epoch} validation loss: {val_loss:.6f}")
 
-        # Save epoch checkpoint and best model
         epoch_ckpt = os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt")
         save_checkpoint(epoch_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
         print("Saved epoch checkpoint:", epoch_ckpt)
