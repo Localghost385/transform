@@ -6,7 +6,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from dataset import get_dataloader
+from dataset import get_dataset  # must return Dataset
 from model import DrumTransformer
 from tqdm import tqdm
 from contextlib import nullcontext
@@ -17,8 +17,6 @@ from contextlib import nullcontext
 def setup_device_and_perf(args):
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_type)
-
-    # CPU / GPU tuning
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         try:
@@ -47,7 +45,6 @@ def save_checkpoint(path, model, optimizer, scaler, scheduler, epoch, step, is_b
         state_dict = model.module.state_dict()
     else:
         state_dict = model.state_dict()
-
     os.makedirs(os.path.dirname(path), exist_ok=True)
     ckpt = {
         "epoch": epoch,
@@ -96,7 +93,7 @@ def train_epoch(model, dataloader, optimizer, scaler, device, scheduler=None,
         autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16) if device.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16)
 
     optimizer.zero_grad()
-    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=prog_desc)
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=prog_desc) if dist.get_rank() == 0 else enumerate(dataloader)
     for batch_idx, (x, y) in pbar:
         x = x.to(device)
         y = y.to(device)
@@ -127,7 +124,8 @@ def train_epoch(model, dataloader, optimizer, scaler, device, scheduler=None,
         total_loss += loss.item() * batch_n * grad_accum
         total_tokens += batch_n
         avg_loss = total_loss / max(1, total_tokens)
-        pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}", "step": global_step})
+        if dist.get_rank() == 0:
+            pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}", "step": global_step})
 
     return avg_loss, global_step
 
@@ -140,7 +138,7 @@ def eval_epoch(model, dataloader, device, use_amp=True):
         autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.float16) if device.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16)
 
     with torch.no_grad():
-        pbar = tqdm(dataloader, desc="Validation", total=len(dataloader))
+        pbar = tqdm(dataloader, desc="Validation", total=len(dataloader)) if dist.get_rank() == 0 else dataloader
         for x, y in pbar:
             x = x.to(device)
             y = y.to(device)
@@ -151,44 +149,41 @@ def eval_epoch(model, dataloader, device, use_amp=True):
             total_loss += loss.item() * batch_n
             total_tokens += batch_n
             avg_loss = total_loss / max(1, total_tokens)
-            pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}"})
+            if dist.get_rank() == 0:
+                if isinstance(pbar, tqdm):
+                    pbar.set_postfix({"avg_loss": f"{avg_loss:.6f}"})
     return avg_loss
 
 # -------------------------
 # Main training entry
 # -------------------------
 def main(args):
-    # ---- detect GPUs ----
     num_gpus = torch.cuda.device_count()
     print(f"Detected {num_gpus} GPUs.")
 
-    # ---- distributed initialization ----
-    if num_gpus > 1:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
-        device = torch.device("cuda", local_rank)
-    else:
-        device = setup_device_and_perf(args)
-
+    device = setup_device_and_perf(args)
     print("Using device:", device)
 
-    # ---- datasets and dataloaders ----
-    train_dataset = get_dataloader(args.train_dir, seq_len=args.seq_len, batch_size=args.batch_size, shuffle=True, augment=False, num_workers=args.num_workers)
-    val_dataset = get_dataloader(args.val_dir, seq_len=args.seq_len, batch_size=args.batch_size, shuffle=False, augment=False, num_workers=max(0, args.num_workers//2))
+    # ---- datasets ----
+    train_dataset = get_dataset(args.train_dir, seq_len=args.seq_len)
+    val_dataset = get_dataset(args.val_dir, seq_len=args.seq_len)
 
+    # ---- samplers / dataloaders ----
     if num_gpus > 1:
+        dist.init_process_group(backend="nccl", rank=args.local_rank, world_size=num_gpus)
         train_sampler = DistributedSampler(train_dataset)
         val_sampler = DistributedSampler(val_dataset, shuffle=False)
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=args.num_workers)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=max(0, args.num_workers//2))
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=max(0, args.num_workers // 2))
     else:
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=max(0, args.num_workers//2))
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=max(0, args.num_workers // 2))
+        train_sampler = None
 
     steps_per_epoch = max(1, math.ceil(len(train_loader.dataset) / args.batch_size / max(1, args.grad_accum)))
     total_steps = steps_per_epoch * args.epochs
-    print(f"Dataset samples: {len(train_loader.dataset)}; steps/epoch (effective): {steps_per_epoch}; total_steps: {total_steps}")
+    if dist.get_rank() == 0:
+        print(f"Dataset samples: {len(train_loader.dataset)}; steps/epoch (effective): {steps_per_epoch}; total_steps: {total_steps}")
 
     # ---- model ----
     model = DrumTransformer(
@@ -204,25 +199,21 @@ def main(args):
     if getattr(args, "use_compile", False) and hasattr(torch, "compile"):
         try:
             model = torch.compile(model)
-            print("Model compiled with torch.compile()")
+            if dist.get_rank() == 0:
+                print("Model compiled with torch.compile()")
         except Exception as e:
-            print("torch.compile failed:", e)
+            if dist.get_rank() == 0:
+                print("torch.compile failed:", e)
 
-    # ---- multi-GPU DDP ----
     if num_gpus > 1:
-        print("Wrapping model with DistributedDataParallel (DDP)")
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
 
-    if hasattr(model, "module"):
-        print(f"Model parameters: {model.module.count_parameters():,}")
-    else:
-        print(f"Model parameters: {model.count_parameters():,}")
+    if dist.get_rank() == 0:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # ---- optimizer / scaler / scheduler ----
     optimizer = build_optimizer(model, lr=args.lr, weight_decay=getattr(args, "weight_decay", 0.01))
     scaler = torch.cuda.amp.GradScaler() if (device.type == "cuda" and args.use_amp) else None
-
     warmup_steps = int(total_steps * getattr(args, "warmup_ratio", 0.03)) if getattr(args, "warmup_steps", None) is None else int(getattr(args, "warmup_steps", 100))
     scheduler = build_scheduler_with_warmup(optimizer, warmup_steps=warmup_steps, total_steps=max(1, total_steps))
 
@@ -234,16 +225,19 @@ def main(args):
         if loaded:
             start_epoch = s_epoch
             global_step = gstep
-            print(f"Resuming from {args.resume_from}: start_epoch={start_epoch}, global_step={global_step}")
+            if dist.get_rank() == 0:
+                print(f"Resuming from {args.resume_from}: start_epoch={start_epoch}, global_step={global_step}")
 
     # ---- training loop ----
     best_val = float("inf")
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    if dist.get_rank() == 0:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     for epoch in range(start_epoch, args.epochs + 1):
-        print(f"\n=== Epoch {epoch}/{args.epochs} ===")
         if num_gpus > 1:
             train_sampler.set_epoch(epoch)
+        if dist.get_rank() == 0:
+            print(f"\n=== Epoch {epoch}/{args.epochs} ===")
 
         train_loss, global_step = train_epoch(
             model=model,
@@ -259,24 +253,32 @@ def main(args):
             start_step=global_step
         )
 
-        print(f"Epoch {epoch} train loss: {train_loss:.6f} (global_step={global_step})")
+        if dist.get_rank() == 0:
+            print(f"Epoch {epoch} train loss: {train_loss:.6f} (global_step={global_step})")
 
-        if args.save_every_steps and args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
-            step_ckpt = os.path.join(args.checkpoint_dir, f"checkpoint_step_{global_step}.pt")
-            save_checkpoint(step_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
-            print("Saved step checkpoint:", step_ckpt)
+            # Checkpoint
+            if args.save_every_steps and args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                step_ckpt = os.path.join(args.checkpoint_dir, f"checkpoint_step_{global_step}.pt")
+                save_checkpoint(step_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
+                print("Saved step checkpoint:", step_ckpt)
 
-        val_loss = eval_epoch(model, val_loader, device, use_amp=args.use_amp)
-        print(f"Epoch {epoch} validation loss: {val_loss:.6f}")
+            # Evaluate
+            val_loss = eval_epoch(model, val_loader, device, use_amp=args.use_amp)
+            print(f"Epoch {epoch} validation loss: {val_loss:.6f}")
 
-        epoch_ckpt = os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt")
-        save_checkpoint(epoch_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
-        print("Saved epoch checkpoint:", epoch_ckpt)
+            # Save epoch checkpoint
+            epoch_ckpt = os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt")
+            save_checkpoint(epoch_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
+            print("Saved epoch checkpoint:", epoch_ckpt)
 
-        if val_loss < best_val:
-            best_val = val_loss
-            best_ckpt = os.path.join(args.checkpoint_dir, "best_model.pt")
-            save_checkpoint(best_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
-            print("Saved new best model:", best_ckpt)
+            if val_loss < best_val:
+                best_val = val_loss
+                best_ckpt = os.path.join(args.checkpoint_dir, "best_model.pt")
+                save_checkpoint(best_ckpt, model, optimizer, scaler, scheduler, epoch, global_step)
+                print("Saved new best model:", best_ckpt)
 
-    print("Training complete.")
+    if num_gpus > 1:
+        dist.destroy_process_group()
+
+    if dist.get_rank() == 0:
+        print("Training complete.")
