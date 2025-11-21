@@ -1,77 +1,63 @@
-from __future__ import annotations
 import argparse
-import logging
-import sys
-from typing import List
-from importlib.metadata import version, PackageNotFoundError
+import os
+from preprocess import process_all_files
+from train import main as train_main
+from generate import main as generate_main
 
-"""Entry point for the midi package.
+def main():
+    parser = argparse.ArgumentParser(description="Drum Transformer CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Sub-command: preprocess / train / generate")
 
-Usage:
-    python -m midi [--version] [-v|--verbose]
-"""
+    # Preprocess
+    preprocess_parser = subparsers.add_parser("preprocess", help="Convert MIDI files to NPZ")
+    preprocess_parser.add_argument("--input_dir", type=str, required=True)
+    preprocess_parser.add_argument("--output_dir", type=str, required=True)
+    preprocess_parser.add_argument("--drum_map", type=str, required=True)
+    preprocess_parser.add_argument("--steps_per_bar", type=int, default=16)
 
+    # Train
+    train_parser = subparsers.add_parser("train", help="Train Drum Transformer")
+    train_parser.add_argument("--train_dir", type=str, required=True)
+    train_parser.add_argument("--val_dir", type=str, required=True)
+    train_parser.add_argument("--num_classes", type=int, default=23)
+    train_parser.add_argument("--seq_len", type=int, default=512)
+    train_parser.add_argument("--d_model", type=int, default=512)
+    train_parser.add_argument("--nhead", type=int, default=8)
+    train_parser.add_argument("--num_layers", type=int, default=8)
+    train_parser.add_argument("--ff_dim", type=int, default=2048)
+    train_parser.add_argument("--dropout", type=float, default=0.1)
+    train_parser.add_argument("--batch_size", type=int, default=8)
+    train_parser.add_argument("--epochs", type=int, default=50)
+    train_parser.add_argument("--lr", type=float, default=1e-4)
+    train_parser.add_argument("--clip_grad", type=float, default=1.0)
+    train_parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    train_parser.add_argument("--device", type=str, default="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
 
-try:
-    # Python 3.8+
-except Exception:
-    try:
-        # backport for older interpreters
-        from importlib_metadata import version, PackageNotFoundError  # type: ignore
-    except Exception:  # pragma: no cover - fallback stub
-        def version(pkg: str) -> str:
-            return "0.0.0"
-        class PackageNotFoundError(Exception):
-            pass
+    # Generate
+    generate_parser = subparsers.add_parser("generate", help="Generate drum sequences")
+    generate_parser.add_argument("--model_path", type=str, required=True)
+    generate_parser.add_argument("--output_path", type=str, default="generated_sequence.npz")
+    generate_parser.add_argument("--seed", type=int, default=42)
+    generate_parser.add_argument("--length_bars", type=int, default=64)
+    generate_parser.add_argument("--steps_per_bar", type=int, default=16)
+    generate_parser.add_argument("--temperature", type=float, default=1.0)
+    generate_parser.add_argument("--device", type=str, default="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
+    generate_parser.add_argument("--num_classes", type=int, default=23)
+    generate_parser.add_argument("--seq_len", type=int, default=512)
 
-PACKAGE_NAME = "midi"
+    args = parser.parse_args()
 
+    if args.command == "preprocess":
+        os.makedirs(args.output_dir, exist_ok=True)
+        process_all_files(args.input_dir, args.output_dir, args.drum_map, steps_per_bar=args.steps_per_bar)
+    elif args.command == "train":
+        from train import main as train_main
+        train_main(args)  # pass parsed args
+    elif args.command == "generate":
+        from generate import main as generate_main
+        generate_main(args)  # pass parsed args
+    else:
+        raise ValueError(f"Unknown command: {args.command}")
 
-def get_version() -> str:
-    try:
-        return version(PACKAGE_NAME)
-    except PackageNotFoundError:
-        return "0.0.0"
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog=PACKAGE_NAME, description="midi - command line interface")
-    p.add_argument("-v", "--verbose", action="store_true", help="enable verbose logging")
-    p.add_argument("--version", action="store_true", help="print version and exit")
-    return p
-
-
-def configure_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
-
-
-def run(argv: List[str]) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv[1:])
-
-    if args.version:
-        print(get_version())
-        return 0
-
-    configure_logging(args.verbose)
-    logging.info("Starting midi package")
-    # TODO: replace the block below with actual application logic
-    try:
-        logging.debug("Running main task (placeholder)")
-        # ... actual work here ...
-        return 0
-    except KeyboardInterrupt:
-        logging.info("Interrupted by user")
-        return 2
-    except Exception:
-        logging.exception("Unhandled exception")
-        return 1
-
-
-def main() -> None:
-    raise SystemExit(run(sys.argv))
-
-
-if __name__ == "__main__":  
+if __name__ == "__main__":
     main()

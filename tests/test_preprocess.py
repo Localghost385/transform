@@ -121,7 +121,7 @@ def test_save_npz():
     fd, path = tempfile.mkstemp(suffix=".npz")
     os.close(fd)
     save_npz(path, X)
-    data = np.load(path)['X']
+    data = np.load(path)['sequence']
     assert np.array_equal(data, X)
     os.remove(path)
 
@@ -138,7 +138,7 @@ def test_process_single_file(simple_midi_file, drum_map_file):
     files = os.listdir(output_dir)
     assert len(files) == 1
     npz_path = os.path.join(output_dir, files[0])
-    data = np.load(npz_path)['X']
+    data = np.load(npz_path)['sequence']
     assert data.shape[1] == len(set(pitch_to_class.values()))
     
     # cleanup
@@ -164,7 +164,7 @@ def test_process_all_files(simple_midi_file, drum_map_file):
     files = os.listdir(output_dir)
     assert len(files) == 1
     npz_path = os.path.join(output_dir, files[0])
-    data = np.load(npz_path)['X']
+    data = np.load(npz_path)['sequence']
     assert data.shape[1] == 2  # kick+snare
     
     # cleanup
