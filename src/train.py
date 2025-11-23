@@ -41,7 +41,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, path):
         'epoch': epoch,
         'model_state': model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
-        'scheduler_state': scheduler.state_dict()
+        'scheduler_state': scheduler.state_dict() if scheduler else None
     }, path)
 
 def load_checkpoint(model, optimizer, scheduler, path, device):
@@ -51,7 +51,8 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
     else:
         model.load_state_dict(checkpoint['model_state'])
     optimizer.load_state_dict(checkpoint['optimizer_state'])
-    scheduler.load_state_dict(checkpoint['scheduler_state'])
+    if scheduler and 'scheduler_state' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state'])
     return checkpoint['epoch']
 
 # -------------------- Training Loop --------------------
@@ -77,7 +78,8 @@ def train(rank, world_size, args):
         shuffle=(sampler is None),
         num_workers=args.num_workers,
         sampler=sampler,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        pin_memory=True
     )
 
     # -------------------- Model --------------------
@@ -91,14 +93,13 @@ def train(rank, world_size, args):
     ).to(device)
 
     if world_size > 1:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         print(f"[Rank {local_rank}] Model wrapped in DDP")
 
     # -------------------- Optimizer, Scheduler & AMP --------------------
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
-
+    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
 
     bce_loss = nn.BCELoss()
     start_epoch = 0
@@ -122,7 +123,7 @@ def train(rank, world_size, args):
             metrics_list = batch['metrics']
 
             optimizer.zero_grad()
-            with torch.amp.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
+            with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
                 step_pred, bar_pred, phrase_pred = model(step, bar, phrase)
                 loss_step = bce_loss(step_pred, step)
                 loss_bar = bce_loss(bar_pred, bar) if bar_pred is not None else 0.0
@@ -137,10 +138,16 @@ def train(rank, world_size, args):
 
                 total_loss = supervised_loss + rl_loss
 
-            scaler.scale(total_loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.scale(total_loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+
             epoch_loss += total_loss.item()
 
         scheduler.step()
@@ -185,8 +192,6 @@ if __name__ == "__main__":
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     world_size = args.num_gpus
 
-    if world_size > 1:
-        import torch.multiprocessing as mp
-        mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
-    else:
-        train(0, world_size, args)
+    # -------------------- DDP / Multi-GPU --------------------
+    # Use LOCAL_RANK environment variable, compatible with Kaggle
+    train(0, world_size, args)
