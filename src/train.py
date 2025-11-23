@@ -1,7 +1,6 @@
 import os
 import argparse
 import numpy as np
-from collections import defaultdict
 from tqdm import tqdm
 
 import torch
@@ -11,25 +10,17 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-from dataset import CompleteHierarchicalDrumDataset  # your module
-from model import HierarchicalDrumModel  # your module
+from dataset import CompleteHierarchicalDrumDataset
+from model import HierarchicalDrumModel
 
 # -------------------- RL Reward Computation --------------------
 def compute_reward(logits, metrics, device):
-    """
-    Compute adaptive hierarchical RL reward.
-    Returns scalar tensor.
-    """
     step_metrics = metrics['step']
-    # Example simple reward: density, syncopation, IOI variance
     dense_frac = torch.tensor(step_metrics['dense_frac'], device=device)
     sync = torch.tensor(step_metrics['sync'], device=device)
     ioi_var = torch.tensor(step_metrics['ioi_stats'][:,1].mean(), device=device)
-    
-    # Adaptive weighting: give higher weight to metrics with higher variance
     weights = torch.tensor([dense_frac, sync, ioi_var], device=device)
     weights = weights / (weights.sum() + 1e-6)
-    
     reward = (weights * torch.tensor([dense_frac, sync, 1.0/ioi_var], device=device)).sum()
     return reward, weights
 
@@ -77,19 +68,18 @@ def train(rank, world_size, args):
     # -------------------- Model --------------------
     model = HierarchicalDrumModel(num_drums=args.num_drums, step_hidden_dim=args.d_model,
                                   bar_hidden_dim=args.d_model, phrase_hidden_dim=args.d_model,
-                                  num_layers=args.num_layers, dropout=args.dropout)
-    model.to(device)
+                                  num_layers=args.num_layers, dropout=args.dropout).to(device)
     if world_size > 1:
         model = DDP(model, device_ids=[rank])
-
-    # -------------------- Optimizer and Scheduler --------------------
+    
+    # -------------------- Optimizer & Scheduler --------------------
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
+    
     # -------------------- Mixed Precision --------------------
     scaler = torch.cuda.amp.GradScaler()
 
-    # -------------------- Loss Function --------------------
+    # -------------------- Loss --------------------
     bce_loss = nn.BCELoss()
 
     # -------------------- Resume --------------------
@@ -104,7 +94,9 @@ def train(rank, world_size, args):
             sampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch} [Rank {rank}]"):
+        adaptive_weights = None
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Rank {rank}]") if rank == 0 else dataloader
+        for batch in pbar:
             step = batch['step'].to(device)
             bar = batch['bar'].to(device)
             phrase = batch['phrase'].to(device)
@@ -118,11 +110,8 @@ def train(rank, world_size, args):
                 loss_phrase = bce_loss(phrase_pred, phrase) if phrase_pred is not None else 0.0
                 supervised_loss = loss_step + loss_bar + loss_phrase
 
-                # Compute RL reward
                 rl_loss = 0.0
-                adaptive_weights = None
                 if args.rl_enabled:
-                    # For simplicity, use first sample metrics in batch
                     reward, adaptive_weights = compute_reward(step_pred, metrics_list[0], device)
                     rl_loss = -args.rl_weight * reward
 
@@ -136,7 +125,8 @@ def train(rank, world_size, args):
 
         scheduler.step()
         if rank == 0:
-            print(f"Epoch {epoch}: loss={epoch_loss/len(dataloader):.6f}", end='')
+            avg_loss = epoch_loss / len(dataloader)
+            print(f"Epoch {epoch}: loss={avg_loss:.6f}", end='')
             if adaptive_weights is not None:
                 print(f", adaptive_weights={adaptive_weights.cpu().numpy()}")
             else:
@@ -176,7 +166,6 @@ if __name__ == "__main__":
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     world_size = args.num_gpus
     if world_size > 1:
-        # DDP launch: torchrun --nproc_per_node=NUM_GPUS train.py ...
         import torch.multiprocessing as mp
         mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
     else:
