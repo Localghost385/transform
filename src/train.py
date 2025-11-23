@@ -187,8 +187,9 @@ def train(rank, world_size, local_rank, args):
 
                 # BCE on whole padded sequences — keep semantics same as original
                 loss_step = bce_loss(step_logits, step)
-                loss_bar = bce_loss(bar_logits, bar) if bar_logits is not None else 0.0
-                loss_phrase = bce_loss(phrase_logits, phrase) if phrase_logits is not None else 0.0
+                loss_bar = bce_loss(bar_logits, bar) if bar_logits is not None else 0.0*model.bar_layer.weight.sum()
+                loss_phrase = bce_loss(phrase_logits, phrase) if phrase_logits is not None else 0.0*model.phrase_layer.weight.sum()
+
                 supervised_loss = loss_step + loss_bar + loss_phrase
 
                 rl_loss = 0.0
