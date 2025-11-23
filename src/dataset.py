@@ -1,4 +1,6 @@
+# dataset.py
 import os
+import time
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -6,30 +8,84 @@ from tqdm import tqdm
 
 class CachedHierarchicalDrumDataset(Dataset):
     """
-    Fully cached hierarchical drum dataset with file caching.
-    Precomputes step/bar/phrase sequences and all metrics in memory.
-    Saves cache to disk to avoid recomputation.
+    Cached hierarchical drum dataset with safe file caching and DDP coordination.
+
+    Behavior:
+      - If cache file exists, load it.
+      - If running under torch.distributed and cache does NOT exist:
+          - rank 0 will build and atomically write the cache file
+          - other ranks will wait until the file appears, then load it
+      - Uses torch.load(..., weights_only=False) when available (PyTorch >= 2.6)
+        and falls back to torch.load(...) otherwise.
     """
-    def __init__(self, npz_dir, seq_len=512, steps_per_bar=16, bars_per_phrase=4,
-                 augment=False, fast_threshold=4, verbose=True, cache_file="dataset_cache.pt"):
+
+    def __init__(self,
+                 npz_dir,
+                 seq_len=512,
+                 steps_per_bar=16,
+                 bars_per_phrase=4,
+                 augment=False,
+                 fast_threshold=4,
+                 verbose=True,
+                 cache_file="dataset_cache.pt",
+                 wait_interval=1.0):
         self.seq_len = seq_len
         self.steps_per_bar = steps_per_bar
         self.bars_per_phrase = bars_per_phrase
         self.phrase_len = steps_per_bar * bars_per_phrase
         self.augment = augment
         self.fast_threshold = fast_threshold
+        self.verbose = verbose
         self.cache_file = os.path.join(npz_dir, cache_file)
+        self._wait_interval = float(wait_interval)
 
-        # Load cache if available
+        # Determine distributed rank if available
+        self._is_distributed = False
+        self._rank = 0
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                self._is_distributed = True
+                self._rank = dist.get_rank()
+            else:
+                # dist isn't initialized yet; check env var fallback
+                env_rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
+                if env_rank is not None:
+                    try:
+                        self._rank = int(env_rank)
+                    except Exception:
+                        self._rank = 0
+        except Exception:
+            self._is_distributed = False
+            self._rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        # If cache exists, load it (fast path)
         if os.path.exists(self.cache_file):
             if verbose:
-                print(f"Loading dataset cache from {self.cache_file}")
-            self.cache = torch.load(self.cache_file)
+                print(f"[rank {self._rank}] Loading dataset cache from {self.cache_file}")
+            self.cache = self._safe_torch_load(self.cache_file)
             if verbose:
-                print(f"Loaded {len(self.cache)} samples from cache")
+                print(f"[rank {self._rank}] Loaded {len(self.cache)} samples from cache")
             return
 
-        # Load NPZ files
+        # If distributed, coordinate: only rank 0 builds cache, others wait
+        if self._is_distributed and self._rank != 0:
+            # Wait for rank 0 to create the cache file
+            if verbose:
+                print(f"[rank {self._rank}] Waiting for cache file {self.cache_file} to appear...")
+            while not os.path.exists(self.cache_file):
+                time.sleep(self._wait_interval)
+            if verbose:
+                print(f"[rank {self._rank}] Cache file detected, loading...")
+            self.cache = self._safe_torch_load(self.cache_file)
+            if verbose:
+                print(f"[rank {self._rank}] Loaded {len(self.cache)} samples from cache")
+            return
+
+        # Otherwise (rank 0 or non-distributed), build the cache and write it
+        if verbose:
+            print(f"[rank {self._rank}] Building dataset cache from npz files in {npz_dir} ...")
+
         files = [os.path.join(npz_dir, f) for f in os.listdir(npz_dir) if f.endswith('.npz')]
         sequences = []
         for f in tqdm(files, desc="Loading NPZ files"):
@@ -39,18 +95,20 @@ class CachedHierarchicalDrumDataset(Dataset):
                     continue
                 sequences.append(data)
             except KeyError:
+                if verbose:
+                    print(f"Warning: 'sequence' key not found in {f}, skipping.")
                 continue
 
         if len(sequences) == 0:
             raise ValueError(f"No valid sequences found in {npz_dir}.")
 
-        # -------------------- Precompute cache --------------------
+        # Precompute cache in memory
         self.cache = []
         for seq_idx, seq in enumerate(tqdm(sequences, desc="Caching sequences")):
             max_start = max(1, seq.shape[0] - seq_len)
             for start_idx in range(max_start):
                 step_seq = seq[start_idx:start_idx + seq_len]
-                bar_seq = self._aggregate(step_seq, steps_per_bar)
+                bar_seq = self._aggregate(step_seq, self.steps_per_bar)
                 phrase_seq = self._aggregate(step_seq, self.phrase_len)
                 metrics = self.compute_all_metrics(step_seq, bar_seq, phrase_seq)
                 self.cache.append({
@@ -60,10 +118,25 @@ class CachedHierarchicalDrumDataset(Dataset):
                     "metrics": metrics
                 })
 
-        # Save cache to file
-        torch.save(self.cache, self.cache_file)
+        # Atomically write the cache file (write to tmp then rename)
+        tmp_path = self.cache_file + ".tmp"
         if verbose:
-            print(f"Cached {len(self.cache)} samples and saved to {self.cache_file}")
+            print(f"[rank {self._rank}] Saving cache ({len(self.cache)} samples) to {self.cache_file} ...")
+        try:
+            # Use torch.save for pickled structures
+            torch.save(self.cache, tmp_path)
+            # atomic replace
+            os.replace(tmp_path, self.cache_file)
+            if verbose:
+                print(f"[rank {self._rank}] Cache saved to {self.cache_file}")
+        except Exception as e:
+            # If writing fails, try to remove tmp and raise
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise RuntimeError(f"Failed to write dataset cache to {self.cache_file}: {e}") from e
 
     def __len__(self):
         return len(self.cache)
@@ -74,22 +147,25 @@ class CachedHierarchicalDrumDataset(Dataset):
             step = sample["step"]
             shift = np.random.randint(-2, 3)
             step = torch.roll(step, shifts=shift, dims=0)
+            # recompute bar/phrase from shifted step (fast)
             bar = self._aggregate(step.numpy(), self.steps_per_bar)
             phrase = self._aggregate(step.numpy(), self.phrase_len)
-            bar = torch.from_numpy(bar).float()
-            phrase = torch.from_numpy(phrase).float()
-            return {"step": step, "bar": bar, "phrase": phrase, "metrics": sample["metrics"]}
+            return {"step": step, "bar": torch.from_numpy(bar).float(),
+                    "phrase": torch.from_numpy(phrase).float(), "metrics": sample["metrics"]}
         return sample
 
-    # -------------------- Aggregation --------------------
+    # -------------------- Helpers --------------------
     def _aggregate(self, seq, step_size):
+        # seq is a numpy array or torch tensor convertible to numpy
+        if isinstance(seq, torch.Tensor):
+            seq = seq.numpy()
         num_units = seq.shape[0] // step_size
         if num_units == 0:
             return seq.mean(axis=0, keepdims=True)
         return seq[:num_units*step_size].reshape(num_units, step_size, -1).mean(axis=1)
 
-    # -------------------- Metric computation --------------------
     def compute_all_metrics(self, step_seq, bar_seq, phrase_seq):
+        # Helpers
         def _hit_density(seq):
             total_hits = seq.sum(axis=1)
             avg_hits = total_hits.mean()
@@ -207,3 +283,22 @@ class CachedHierarchicalDrumDataset(Dataset):
                 "hits_per_bar": phrase_hits_per_bar
             }
         }
+
+    # -------------------- Robust torch.load wrapper --------------------
+    def _safe_torch_load(self, path):
+        """
+        Load with weights_only=False when available, otherwise fall back to default.
+        """
+        try:
+            # Try to call torch.load with weights_only param (PyTorch 2.6+)
+            return torch.load(path, weights_only=False)
+        except TypeError:
+            # Older PyTorch versions don't support weights_only; fall back
+            return torch.load(path)
+        except Exception as e:
+            # If unpickling error, re-raise with helpful message
+            raise RuntimeError(
+                f"Failed to load cache file {path}. If this file was created by a different "
+                f"PyTorch version or contains custom objects, you may need to recreate it. "
+                f"Original error: {e}"
+            ) from e
