@@ -23,7 +23,36 @@ def collate_fn(batch):
     }
 
 # -------------------- Batched RL Reward --------------------
-def compute_reward_batch(step_probs, metrics_list, device):
+def compute_hierarchical_reward(step_probs, bar_probs, phrase_probs, metrics_list, device):
+    """Compute hierarchical RL rewards per level and adaptive weights."""
+    
+    def _compute_level_rewards(probs, metrics, feature_keys):
+        dense_fracs, syncs, ioi_vars = [], [], []
+        for m in metrics:
+            dense_fracs.append(m['dense_frac'])
+            syncs.append(m['sync'])
+            ioi_vars.append(m['ioi_stats'][:, 1].mean())
+        dense_fracs = torch.tensor(dense_fracs, device=device, dtype=torch.float32)
+        syncs = torch.tensor(syncs, device=device, dtype=torch.float32)
+        ioi_vars = torch.tensor(ioi_vars, device=device, dtype=torch.float32)
+        features = torch.stack([
+            dense_fracs / (dense_fracs.max() + 1e-6),
+            syncs / (syncs.max() + 1e-6),
+            1.0 / (ioi_vars + 1e-6)
+        ], dim=1)
+        features = features / (features.sum(dim=1, keepdim=True) + 1e-6)
+        adaptive_weights = torch.softmax(features, dim=1)
+        rewards = (adaptive_weights * features).sum(dim=1)
+        return rewards, adaptive_weights
+
+    step_rewards, step_weights = _compute_level_rewards(step_probs, [m['step'] for m in metrics_list], ['dense_frac','sync','ioi'])
+    bar_rewards, bar_weights = _compute_level_rewards(bar_probs, [m['bar'] for m in metrics_list], ['dense_frac','sync','ioi'])
+    phrase_rewards, phrase_weights = _compute_level_rewards(phrase_probs, [m['phrase'] for m in metrics_list], ['dense_frac','sync','ioi'])
+
+    # Combine hierarchical rewards (you can tune these weights)
+    rl_rewards = 0.5*step_rewards + 0.3*bar_rewards + 0.2*phrase_rewards
+    return rl_rewards, (step_weights, bar_weights, phrase_weights)
+
     dense_fracs = []
     syncs = []
     ioi_vars = []
@@ -176,8 +205,10 @@ def train(rank, world_size, args):
 
                 if args.rl_enabled:
                     step_probs = torch.sigmoid(step_logits)
+                    bar_probs = torch.sigmoid(bar_logits) if bar_logits is not None else None
+                    phrase_probs = torch.sigmoid(phrase_logits) if phrase_logits is not None else None
                     with torch.no_grad():
-                        rewards, adaptive_weights = compute_reward_batch(step_probs, metrics_list, device)
+                        rewards, adaptive_weights = compute_hierarchical_reward(step_probs, bar_probs, phrase_probs, metrics_list, device)
                     rl_loss = -args.rl_weight * rewards.mean()
 
                 total_loss = supervised_loss + rl_loss
