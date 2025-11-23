@@ -96,8 +96,61 @@ class DrumTransformer(nn.Module):
     def save(self, path):
         torch.save(self.state_dict(), path)
 
-    def load(self, path, map_location=None):
-        self.load_state_dict(torch.load(path, map_location=map_location))
+    def load(self, path, map_location=None, strict=False, print_missing=True):
+        """
+        Robustly load a checkpoint or bare state_dict.
+
+        - If path points to a training checkpoint (dict with "model_state_dict"), that is extracted.
+        - Removes "module." prefixes (from DataParallel / DDP) automatically.
+        - Calls load_state_dict(..., strict=strict).
+        - If print_missing=True, prints missing/unexpected keys summary.
+        """
+        ckpt = torch.load(path, map_location=map_location)
+
+        # If it's a training checkpoint, extract model_state_dict
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+        elif isinstance(ckpt, dict) and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+            # probably already a raw state_dict
+            state_dict = ckpt
+        else:
+            state_dict = ckpt
+
+        # Remove 'module.' prefix if present (from DataParallel / DDP)
+        new_state = {}
+        for k, v in state_dict.items():
+            new_k = k
+            if k.startswith("module."):
+                new_k = k[len("module."):]
+            new_state[new_k] = v
+
+        # Try to load
+        missing_keys, unexpected_keys = self.load_state_dict(new_state, strict=strict)
+
+        # For modern torch versions load_state_dict returns NamedTuple with missing/unexpected.
+        # If it returned None (older style) we can attempt to deduce nothing further here.
+        try:
+            missing = missing_keys.missing_keys
+            unexpected = missing_keys.unexpected_keys
+        except Exception:
+            # Fallback for older torch - ignore
+            missing = None
+            unexpected = None
+
+        if print_missing:
+            if missing is not None:
+                if len(missing) > 0:
+                    print("[LOAD] Missing keys:", missing)
+                else:
+                    print("[LOAD] No missing keys.")
+            if unexpected is not None:
+                if len(unexpected) > 0:
+                    print("[LOAD] Unexpected keys:", unexpected)
+                else:
+                    print("[LOAD] No unexpected keys.")
+
+        return missing, unexpected
+
 
 
 if __name__ == "__main__":

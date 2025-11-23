@@ -23,12 +23,8 @@ def main():
     # TRAIN
     # -------------------------
     train_parser = subparsers.add_parser("train", help="Train Drum Transformer")
-
-    # Required
     train_parser.add_argument("--train_dir", type=str, required=True)
     train_parser.add_argument("--val_dir", type=str, required=True)
-
-    # Model architecture
     train_parser.add_argument("--num_classes", type=int, default=23)
     train_parser.add_argument("--seq_len", type=int, default=512)
     train_parser.add_argument("--d_model", type=int, default=512)
@@ -36,32 +32,22 @@ def main():
     train_parser.add_argument("--num_layers", type=int, default=8)
     train_parser.add_argument("--ff_dim", type=int, default=2048)
     train_parser.add_argument("--dropout", type=float, default=0.1)
-
-    # Training settings
     train_parser.add_argument("--batch_size", type=int, default=8)
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--lr", type=float, default=1e-4)
     train_parser.add_argument("--weight_decay", type=float, default=0.01)
     train_parser.add_argument("--clip_grad", type=float, default=1.0)
     train_parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
-
-    # Performance settings
     train_parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision")
     train_parser.add_argument("--use_compile", action="store_true", help="Enable torch.compile()")
     train_parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
     train_parser.add_argument("--num_workers", type=int, default=2)
     train_parser.add_argument("--num_threads", type=int, default=4)
-
-    # LR warmup
     train_parser.add_argument("--warmup_steps", type=int, default=None)
     train_parser.add_argument("--warmup_ratio", type=float, default=0.03)
-
-    # Checkpoints
     train_parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     train_parser.add_argument("--save_every_steps", type=int, default=500)
     train_parser.add_argument("--resume_from", type=str, default=None)
-
-    # Device
     default_device = "cuda" if torch.cuda.is_available() else "cpu"
     train_parser.add_argument("--device", type=str, default=default_device)
 
@@ -74,10 +60,17 @@ def main():
     generate_parser.add_argument("--seed", type=int, default=42)
     generate_parser.add_argument("--length_bars", type=int, default=64)
     generate_parser.add_argument("--steps_per_bar", type=int, default=16)
-    generate_parser.add_argument("--temperature", type=float, default=1.0)
+    generate_parser.add_argument("--temperature", type=float, default=0.7)  # lowered default for less gibberish
+    generate_parser.add_argument("--top_k", type=int, default=8, help="Top-k sampling for generation")
+    generate_parser.add_argument("--use_seed", action="store_true", help="Use a minimal seed pattern to improve generation quality")
     generate_parser.add_argument("--device", type=str, default=default_device)
     generate_parser.add_argument("--num_classes", type=int, default=23)
     generate_parser.add_argument("--seq_len", type=int, default=512)
+    generate_parser.add_argument("--prob_threshold", type=float, default=0.5, help="Probability threshold for multi-hot sampling")
+    generate_parser.add_argument("--stochastic", action="store_true", help="Use stochastic sampling instead of greedy")
+    generate_parser.add_argument("--visualize", action="store_true", help="Visualize the generated sequence probabilities")
+    generate_parser.add_argument("--debug", action="store_true", help="Enable debug output during generation")
+    generate_parser.add_argument("--drum_map_path", type=str, required=True)
 
     args = parser.parse_args()
 

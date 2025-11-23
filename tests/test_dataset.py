@@ -1,69 +1,83 @@
 import os
-import shutil
-import sys
-import pytest
 import numpy as np
 import torch
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
-from src.dataset import DrumDataset, get_dataloader
+import pytest
+from torch.utils.data import DataLoader
+from src.dataset import CompleteHierarchicalDrumDataset, get_complete_rl_dataloader  # Adjust import
 
-# Temporary directory for test .npz files
-TEST_DIR = "test_npz"
+# -------------------- Fixtures --------------------
+@pytest.fixture
+def temp_npz_dir(tmp_path):
+    """Create temporary NPZ files with synthetic drum sequences."""
+    npz_dir = tmp_path
+    for i in range(3):
+        seq_len = np.random.randint(64, 128)
+        num_drums = 5
+        sequence = np.random.randint(0, 2, size=(seq_len, num_drums)).astype(np.float32)
+        np.savez(npz_dir / f"seq_{i}.npz", sequence=sequence)
+    return npz_dir
 
-@pytest.fixture(scope="module")
-def setup_test_data():
-    os.makedirs(TEST_DIR, exist_ok=True)
+# -------------------- Dataset Tests --------------------
+def test_dataset_loading(temp_npz_dir):
+    dataset = CompleteHierarchicalDrumDataset(temp_npz_dir, seq_len=32)
+    assert len(dataset) > 0, "Dataset should have samples"
+    sample = dataset[0]
+    assert "step" in sample and "bar" in sample and "phrase" in sample and "metrics" in sample
+    assert isinstance(sample["step"], torch.Tensor)
+    assert isinstance(sample["metrics"], dict)
+    # Check step sequence length
+    assert sample["step"].shape[0] <= 32
+
+def test_augmentation_shift(temp_npz_dir):
+    dataset = CompleteHierarchicalDrumDataset(temp_npz_dir, seq_len=32, augment=True)
+    sample1 = dataset[0]["step"].numpy()
+    sample2 = dataset[0]["step"].numpy()
+    # With augmentation, sequences may differ due to shift
+    assert sample1.shape == sample2.shape
+
+def test_metric_shapes(temp_npz_dir):
+    dataset = CompleteHierarchicalDrumDataset(temp_npz_dir, seq_len=32, steps_per_bar=8, bars_per_phrase=2)
+    sample = dataset[0]
+    step_metrics = sample["metrics"]["step"]
+    bar_metrics = sample["metrics"]["bar"]
+    phrase_metrics = sample["metrics"]["phrase"]
     
-    # Create 3 test sequences with different lengths
-    seq1 = np.random.randint(0, 2, size=(600, 10)).astype(np.float32)  # longer than seq_len
-    seq2 = np.random.randint(0, 2, size=(512, 10)).astype(np.float32)  # equal to seq_len
-    seq3 = np.random.randint(0, 2, size=(200, 10)).astype(np.float32)  # shorter than seq_len
+    # IOI stats shape
+    assert step_metrics["ioi_stats"].shape[1] == 2 or step_metrics["ioi_stats"].shape[1] == len(step_metrics["fast"])
+    
+    # Hits per bar
+    assert phrase_metrics["hits_per_bar"].shape[1] == sample["step"].shape[1]
 
-    np.savez(os.path.join(TEST_DIR, "seq1.npz"), sequence=seq1)
-    np.savez(os.path.join(TEST_DIR, "seq2.npz"), sequence=seq2)
-    np.savez(os.path.join(TEST_DIR, "seq3.npz"), sequence=seq3)
+def test_empty_sequence_handling(tmp_path):
+    empty_file = tmp_path / "empty.npz"
+    np.savez(empty_file, sequence=np.zeros((0, 5), dtype=np.float32))
+    # Should raise error if all sequences invalid
+    with pytest.raises(ValueError):
+        CompleteHierarchicalDrumDataset(tmp_path, seq_len=32)
 
-    yield TEST_DIR
+# -------------------- Dataloader Tests --------------------
+def test_dataloader_batch_shapes(temp_npz_dir):
+    dataloader = get_complete_rl_dataloader(temp_npz_dir, seq_len=32, batch_size=2, num_workers=0)
+    batch = next(iter(dataloader))
+    # Check tensor shapes
+    assert batch["step"].shape[0] == 2
+    assert batch["bar"].shape[0] == 2
+    assert batch["phrase"].shape[0] == 2
+    # Metrics list length
+    assert len(batch["metrics"]) == 2
+    # Check metrics contents
+    for metrics in batch["metrics"]:
+        assert "step" in metrics and "bar" in metrics and "phrase" in metrics and "song" in metrics
 
-    # Cleanup
-    shutil.rmtree(TEST_DIR)
+def test_collate_padding(temp_npz_dir):
+    # Create sequences of different lengths
+    for i in range(2):
+        seq_len = 16 + i*4
+        sequence = np.random.randint(0, 2, size=(seq_len, 5)).astype(np.float32)
+        np.savez(temp_npz_dir / f"seq_pad_{i}.npz", sequence=sequence)
+    
+    dataloader = get_complete_rl_dataloader(temp_npz_dir, seq_len=16, batch_size=2)
+    batch = next(iter(dataloader))
+    # Check padding
+    assert batch["step"].shape[1] >= 16
 
-def test_dataset_length(setup_test_data):
-    dataset = DrumDataset(setup_test_data, seq_len=512)
-    # seq1 -> 600-512=88 samples, seq2 -> 1 sample, seq3 -> 1 sample (too short)
-    expected_len = 88 + 1 + 1
-    assert len(dataset) == expected_len, f"Expected length {expected_len}, got {len(dataset)}"
-
-def test_dataset_item_shape(setup_test_data):
-    dataset = DrumDataset(setup_test_data, seq_len=512)
-    x, y = dataset[0]
-    # Input shape: (seq_len, D) or smaller if sequence shorter
-    assert isinstance(x, torch.Tensor)
-    assert isinstance(y, torch.Tensor)
-    assert x.shape[1] == 10
-    assert y.shape[1] == 10
-
-def test_dataset_short_sequence(setup_test_data):
-    dataset = DrumDataset(setup_test_data, seq_len=512)
-    short_sample = [i for i, (seq_idx, _) in enumerate(dataset.sample_indices)
-                    if dataset.sequences[seq_idx].shape[0] < 512]
-    x, y = dataset[short_sample[0]]
-    seq_len_actual = dataset.sequences[dataset.sample_indices[short_sample[0]][0]].shape[0]
-    assert x.shape[0] == seq_len_actual - 1
-    assert y.shape[0] == seq_len_actual - 1
-
-def test_dataset_augmentation(setup_test_data):
-    dataset = DrumDataset(setup_test_data, seq_len=512, augment=True)
-    x1, y1 = dataset[0]
-    x2, y2 = dataset[0]  # same sample, augmentation may change
-    assert x1.shape == x2.shape
-    assert y1.shape == y2.shape
-
-def test_dataloader_integration(setup_test_data):
-    loader = get_dataloader(setup_test_data, seq_len=512, batch_size=2)
-    for x_batch, y_batch in loader:
-        assert x_batch.shape[1] <= 512
-        assert y_batch.shape[1] <= 512
-        assert x_batch.shape[0] <= 2
-        assert y_batch.shape[0] <= 2
-        break
