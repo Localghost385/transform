@@ -12,7 +12,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from dataset import CompleteHierarchicalDrumDataset
 from model import HierarchicalDrumModel
 
-# -------------------- Collate Function --------------------
+# ------------------------------------------------------------
+# Collate Function
+# ------------------------------------------------------------
 def collate_fn(batch):
     return {
         "step": nn.utils.rnn.pad_sequence([d["step"] for d in batch], batch_first=True),
@@ -21,14 +23,16 @@ def collate_fn(batch):
         "metrics": [d["metrics"] for d in batch]
     }
 
-# -------------------- Batched RL Reward --------------------
+# ------------------------------------------------------------
+# Batched RL Reward
+# ------------------------------------------------------------
 def compute_reward_batch(step_probs, metrics_list, device):
     """
     step_probs: (B, T, D)
     metrics_list: list of B dicts
     Returns:
         rewards: (B,)
-        adaptive_weights: (B, 3)
+        weights: (B, 3)
     """
 
     dense_fracs = []
@@ -41,28 +45,25 @@ def compute_reward_batch(step_probs, metrics_list, device):
         syncs.append(m_step['sync'])
         ioi_vars.append(m_step['ioi_stats'][:, 1].mean())
 
-    # Convert to tensors
     dense_fracs = torch.tensor(dense_fracs, device=device, dtype=torch.float32)
     syncs = torch.tensor(syncs, device=device, dtype=torch.float32)
     ioi_vars = torch.tensor(ioi_vars, device=device, dtype=torch.float32)
 
-    # Weights per sample
     weights = torch.stack([dense_fracs, syncs, ioi_vars], dim=1)  # (B, 3)
     weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
 
-    # Feature vector per sample
     features = torch.stack([
         dense_fracs,
         syncs,
         1.0 / (ioi_vars + 1e-6)
-    ], dim=1)  # (B, 3)
+    ], dim=1)
 
-    rewards = (weights * features).sum(dim=1)  # (B,)
-
+    rewards = (weights * features).sum(dim=1)
     return rewards, weights
 
-
-# -------------------- Checkpointing --------------------
+# ------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------
 def save_checkpoint(model, optimizer, scheduler, epoch, path):
     torch.save({
         'epoch': epoch,
@@ -78,26 +79,28 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
     else:
         model.load_state_dict(checkpoint['model_state'])
     optimizer.load_state_dict(checkpoint['optimizer_state'])
-    if scheduler and 'scheduler_state' in checkpoint and checkpoint['scheduler_state'] is not None:
+    if scheduler and checkpoint.get('scheduler_state') is not None:
         scheduler.load_state_dict(checkpoint['scheduler_state'])
     return checkpoint['epoch']
 
+# ------------------------------------------------------------
+# Training Loop (TORCHRUN READY)
+# ------------------------------------------------------------
+def train(rank, world_size, local_rank, args):
 
-# -------------------- Training Loop --------------------
-def train(rank, world_size, args):
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
-    if device.type == 'cuda':
+    # Device setup
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
         torch.cuda.set_device(device)
 
-    # DDP initialization
+    # --- DDP initialization ---
     if world_size > 1:
         dist.init_process_group(
-            backend='nccl',
-            rank=local_rank,
+            backend="nccl",
+            rank=rank,
             world_size=world_size
         )
-        print(f"[Rank {local_rank}] DDP initialized with {world_size} GPUs")
+        print(f"[Rank {rank}] DDP Initialized (local_rank={local_rank})")
 
     # Dataset & DataLoader
     dataset = CompleteHierarchicalDrumDataset(
@@ -105,6 +108,7 @@ def train(rank, world_size, args):
         seq_len=args.seq_len,
         augment=args.augment
     )
+
     sampler = DistributedSampler(dataset) if world_size > 1 else None
 
     dataloader = DataLoader(
@@ -117,9 +121,9 @@ def train(rank, world_size, args):
         pin_memory=True
     )
 
-    # Get number of drums dynamically
+    # Get input dimensions dynamically
     sample = dataset[0]
-    num_drums = sample['step'].shape[-1]
+    num_drums = sample["step"].shape[-1]
 
     # Model
     model = HierarchicalDrumModel(
@@ -131,6 +135,7 @@ def train(rank, world_size, args):
         dropout=args.dropout
     ).to(device)
 
+    # Wrap in DDP
     if world_size > 1:
         model = DDP(
             model,
@@ -138,9 +143,9 @@ def train(rank, world_size, args):
             output_device=local_rank,
             find_unused_parameters=True
         )
-        print(f"[Rank {local_rank}] Model wrapped in DDP")
+        print(f"[Rank {rank}] Model wrapped with DDP")
 
-    # Optimizer and scheduler
+    # Optimizer, scheduler, AMP
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler() if device.type == "cuda" else None
@@ -150,28 +155,32 @@ def train(rank, world_size, args):
     start_epoch = 0
     if args.resume:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume, device)
-        print(f"[Rank {local_rank}] Resumed from epoch {start_epoch}")
+        print(f"[Rank {rank}] Resumed from epoch {start_epoch}")
 
+    # --------------------------------------------------------
     # Training
+    # --------------------------------------------------------
     for epoch in range(start_epoch, args.epochs):
+
         if sampler:
             sampler.set_epoch(epoch)
 
         model.train()
         epoch_loss = 0.0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Rank {local_rank}]") if local_rank == 0 else dataloader
+        is_main = (rank == 0)
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}") if is_main else dataloader
 
         for batch in pbar:
-            step = batch['step'].to(device)
-            bar = batch['bar'].to(device)
-            phrase = batch['phrase'].to(device)
-            metrics_list = batch['metrics']
+            step = batch["step"].to(device)
+            bar = batch["bar"].to(device)
+            phrase = batch["phrase"].to(device)
+            metrics_list = batch["metrics"]
 
             optimizer.zero_grad()
 
-            with torch.amp.autocast(device_type='cuda' if device.type=='cuda' else 'cpu'):
-                # Forward pass (logits only)
+            with torch.amp.autocast(device_type="cuda" if device.type=="cuda" else "cpu"):
+
                 step_logits, bar_logits, phrase_logits = model(step, bar, phrase)
 
                 loss_step = bce_loss(step_logits, step)
@@ -180,7 +189,6 @@ def train(rank, world_size, args):
 
                 supervised_loss = loss_step + loss_bar + loss_phrase
 
-                # RL loss (batched)
                 rl_loss = 0.0
                 adaptive_weights = None
 
@@ -191,6 +199,7 @@ def train(rank, world_size, args):
                         rewards, adaptive_weights = compute_reward_batch(
                             step_probs, metrics_list, device
                         )
+
                     rl_loss = -args.rl_weight * rewards.mean()
 
                 total_loss = supervised_loss + rl_loss
@@ -210,15 +219,15 @@ def train(rank, world_size, args):
 
         scheduler.step()
 
-        if local_rank == 0:
+        if is_main:
             avg_loss = epoch_loss / len(dataloader)
             msg = f"Epoch {epoch}: loss={avg_loss:.6f}"
 
-            # Log batch-mean adaptive weights
             if adaptive_weights is not None:
                 msg += f", adaptive_weights_mean={adaptive_weights.mean(dim=0).cpu().numpy()}"
 
             print(msg)
+
             save_checkpoint(
                 model,
                 optimizer,
@@ -229,10 +238,10 @@ def train(rank, world_size, args):
 
     if world_size > 1:
         dist.destroy_process_group()
-        print(f"[Rank {local_rank}] DDP process group destroyed")
 
-
-# -------------------- CLI --------------------
+# ------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, required=True)
@@ -254,11 +263,16 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4)
     return parser.parse_args()
 
-# -------------------- Main --------------------
+# ------------------------------------------------------------
+# Main — Torchrun Entry Point
+# ------------------------------------------------------------
 if __name__ == "__main__":
     args = parse_args()
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    world_size = args.num_gpus
 
-    # Single-node (Kaggle) – user can switch to torchrun later
-    train(0, world_size, args)
+    # torchrun sets these automatically
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    train(rank, world_size, local_rank, args)
