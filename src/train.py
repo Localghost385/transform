@@ -1,6 +1,7 @@
 import os
 import argparse
-import numpy as np
+import time
+import math
 from tqdm import tqdm
 
 import torch
@@ -13,15 +14,25 @@ from torch.utils.data import DataLoader, DistributedSampler
 from dataset import CompleteHierarchicalDrumDataset
 from model import HierarchicalDrumModel
 
+# -------------------- Collate Function --------------------
+def collate_fn(batch):
+    return {
+        "step": nn.utils.rnn.pad_sequence([d["step"] for d in batch], batch_first=True),
+        "bar": nn.utils.rnn.pad_sequence([d["bar"] for d in batch], batch_first=True),
+        "phrase": nn.utils.rnn.pad_sequence([d["phrase"] for d in batch], batch_first=True),
+        "metrics": [d["metrics"] for d in batch]
+    }
+
 # -------------------- RL Reward Computation --------------------
 def compute_reward(logits, metrics, device):
     step_metrics = metrics['step']
     dense_frac = torch.tensor(step_metrics['dense_frac'], device=device)
     sync = torch.tensor(step_metrics['sync'], device=device)
-    ioi_var = torch.tensor(step_metrics['ioi_stats'][:,1].mean(), device=device)
+    ioi_var = torch.tensor(step_metrics['ioi_stats'][:, 1].mean(), device=device)
+    
     weights = torch.tensor([dense_frac, sync, ioi_var], device=device)
     weights = weights / (weights.sum() + 1e-6)
-    reward = (weights * torch.tensor([dense_frac, sync, 1.0/ioi_var], device=device)).sum()
+    reward = (weights * torch.tensor([dense_frac, sync, 1.0 / (ioi_var + 1e-6)], device=device)).sum()
     return reward, weights
 
 # -------------------- Checkpointing --------------------
@@ -45,7 +56,7 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
 
 # -------------------- Training Loop --------------------
 def train(rank, world_size, args):
-    # -------------------- DDP Setup --------------------
+    # -------------------- Device & DDP Setup --------------------
     if world_size > 1:
         dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=world_size)
         torch.cuda.set_device(rank)
@@ -53,40 +64,41 @@ def train(rank, world_size, args):
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # -------------------- Dataset and Dataloader --------------------
+    # -------------------- Dataset & DataLoader --------------------
     dataset = CompleteHierarchicalDrumDataset(args.data_dir, seq_len=args.seq_len, augment=args.augment)
     sampler = DistributedSampler(dataset) if world_size > 1 else None
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=(sampler is None),
-                            num_workers=args.num_workers, sampler=sampler,
-                            collate_fn=lambda x: {
-                                "step": nn.utils.rnn.pad_sequence([d["step"] for d in x], batch_first=True),
-                                "bar": nn.utils.rnn.pad_sequence([d["bar"] for d in x], batch_first=True),
-                                "phrase": nn.utils.rnn.pad_sequence([d["phrase"] for d in x], batch_first=True),
-                                "metrics": [d["metrics"] for d in x]
-                            })
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=(sampler is None),
+        num_workers=args.num_workers,
+        sampler=sampler,
+        collate_fn=collate_fn
+    )
 
     # -------------------- Model --------------------
-    model = HierarchicalDrumModel(num_drums=args.num_drums, step_hidden_dim=args.d_model,
-                                  bar_hidden_dim=args.d_model, phrase_hidden_dim=args.d_model,
-                                  num_layers=args.num_layers, dropout=args.dropout).to(device)
+    model = HierarchicalDrumModel(
+        num_drums=args.num_drums,
+        step_hidden_dim=args.d_model,
+        bar_hidden_dim=args.d_model,
+        phrase_hidden_dim=args.d_model,
+        num_layers=args.num_layers,
+        dropout=args.dropout
+    ).to(device)
+
     if world_size > 1:
         model = DDP(model, device_ids=[rank])
-    
-    # -------------------- Optimizer & Scheduler --------------------
+
+    # -------------------- Optimizer, Scheduler & AMP --------------------
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
-    # -------------------- Mixed Precision --------------------
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device_type='cuda' if device.type == 'cuda' else 'cpu')
 
-    # -------------------- Loss --------------------
     bce_loss = nn.BCELoss()
-
-    # -------------------- Resume --------------------
     start_epoch = 0
     if args.resume is not None:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume, device)
-        print(f"Resumed from epoch {start_epoch}")
+        print(f"[Rank {rank}] Resumed from epoch {start_epoch}")
 
     # -------------------- Training --------------------
     for epoch in range(start_epoch, args.epochs):
@@ -94,8 +106,9 @@ def train(rank, world_size, args):
             sampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
-        adaptive_weights = None
+
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Rank {rank}]") if rank == 0 else dataloader
+
         for batch in pbar:
             step = batch['step'].to(device)
             bar = batch['bar'].to(device)
@@ -103,7 +116,7 @@ def train(rank, world_size, args):
             metrics_list = batch['metrics']
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
                 step_pred, bar_pred, phrase_pred = model(step, bar, phrase)
                 loss_step = bce_loss(step_pred, step)
                 loss_bar = bce_loss(bar_pred, bar) if bar_pred is not None else 0.0
@@ -111,6 +124,7 @@ def train(rank, world_size, args):
                 supervised_loss = loss_step + loss_bar + loss_phrase
 
                 rl_loss = 0.0
+                adaptive_weights = None
                 if args.rl_enabled:
                     reward, adaptive_weights = compute_reward(step_pred, metrics_list[0], device)
                     rl_loss = -args.rl_weight * reward
@@ -126,11 +140,10 @@ def train(rank, world_size, args):
         scheduler.step()
         if rank == 0:
             avg_loss = epoch_loss / len(dataloader)
-            print(f"Epoch {epoch}: loss={avg_loss:.6f}", end='')
+            msg = f"Epoch {epoch}: loss={avg_loss:.6f}"
             if adaptive_weights is not None:
-                print(f", adaptive_weights={adaptive_weights.cpu().numpy()}")
-            else:
-                print()
+                msg += f", adaptive_weights={adaptive_weights.cpu().numpy()}"
+            print(msg)
             # Save checkpoint
             save_checkpoint(model, optimizer, scheduler, epoch, os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt"))
 
@@ -165,6 +178,7 @@ if __name__ == "__main__":
     args = parse_args()
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     world_size = args.num_gpus
+
     if world_size > 1:
         import torch.multiprocessing as mp
         mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
