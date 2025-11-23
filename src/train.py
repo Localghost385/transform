@@ -1,7 +1,5 @@
 import os
 import argparse
-import time
-import math
 from tqdm import tqdm
 
 import torch
@@ -29,7 +27,6 @@ def compute_reward(logits, metrics, device):
     dense_frac = torch.tensor(step_metrics['dense_frac'], device=device)
     sync = torch.tensor(step_metrics['sync'], device=device)
     ioi_var = torch.tensor(step_metrics['ioi_stats'][:, 1].mean(), device=device)
-    
     weights = torch.tensor([dense_frac, sync, ioi_var], device=device)
     weights = weights / (weights.sum() + 1e-6)
     reward = (weights * torch.tensor([dense_frac, sync, 1.0 / (ioi_var + 1e-6)], device=device)).sum()
@@ -51,25 +48,23 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
     else:
         model.load_state_dict(checkpoint['model_state'])
     optimizer.load_state_dict(checkpoint['optimizer_state'])
-    if scheduler and 'scheduler_state' in checkpoint:
+    if scheduler and 'scheduler_state' in checkpoint and checkpoint['scheduler_state'] is not None:
         scheduler.load_state_dict(checkpoint['scheduler_state'])
     return checkpoint['epoch']
 
 # -------------------- Training Loop --------------------
 def train(rank, world_size, args):
-    # -------------------- Device & DDP Setup --------------------
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     if device.type == 'cuda':
         torch.cuda.set_device(device)
 
+    # DDP initialization
     if world_size > 1:
         dist.init_process_group(backend='nccl', rank=local_rank, world_size=world_size)
         print(f"[Rank {local_rank}] DDP initialized with {world_size} GPUs")
-    else:
-        print("[DEBUG] Single GPU or CPU mode")
 
-    # -------------------- Dataset & DataLoader --------------------
+    # Dataset & DataLoader
     dataset = CompleteHierarchicalDrumDataset(args.data_dir, seq_len=args.seq_len, augment=args.augment)
     sampler = DistributedSampler(dataset) if world_size > 1 else None
     dataloader = DataLoader(
@@ -82,9 +77,13 @@ def train(rank, world_size, args):
         pin_memory=True
     )
 
-    # -------------------- Model --------------------
+    # Dynamically get number of drums from dataset sample
+    sample = dataset[0]
+    num_drums = sample['step'].shape[-1]
+
+    # Model
     model = HierarchicalDrumModel(
-        num_drums=args.num_drums,
+        num_drums=num_drums,
         step_hidden_dim=args.d_model,
         bar_hidden_dim=args.d_model,
         phrase_hidden_dim=args.d_model,
@@ -96,20 +95,20 @@ def train(rank, world_size, args):
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         print(f"[Rank {local_rank}] Model wrapped in DDP")
 
-    # -------------------- Optimizer, Scheduler & AMP --------------------
+    # Optimizer, Scheduler, AMP
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler() if device.type == "cuda" else None
 
     bce_loss = nn.BCELoss()
     start_epoch = 0
-    if args.resume is not None:
+    if args.resume:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume, device)
         print(f"[Rank {local_rank}] Resumed from epoch {start_epoch}")
 
-    # -------------------- Training Loop --------------------
+    # Training
     for epoch in range(start_epoch, args.epochs):
-        if sampler is not None:
+        if sampler:
             sampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
@@ -123,7 +122,7 @@ def train(rank, world_size, args):
             metrics_list = batch['metrics']
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
+            with torch.amp.autocast(device_type='cuda' if device.type=='cuda' else 'cpu'):
                 step_pred, bar_pred, phrase_pred = model(step, bar, phrase)
                 loss_step = bce_loss(step_pred, step)
                 loss_bar = bce_loss(bar_pred, bar) if bar_pred is not None else 0.0
@@ -138,7 +137,7 @@ def train(rank, world_size, args):
 
                 total_loss = supervised_loss + rl_loss
 
-            if scaler is not None:
+            if scaler:
                 scaler.scale(total_loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
@@ -178,7 +177,6 @@ def parse_args():
     parser.add_argument('--rl_enabled', action='store_true')
     parser.add_argument('--rl_weight', type=float, default=0.1)
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--num_drums', type=int, default=9)
     parser.add_argument('--d_model', type=int, default=128)
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.1)
@@ -192,6 +190,5 @@ if __name__ == "__main__":
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     world_size = args.num_gpus
 
-    # -------------------- DDP / Multi-GPU --------------------
-    # Use LOCAL_RANK environment variable, compatible with Kaggle
+    # Train (Kaggle / single node DDP)
     train(0, world_size, args)
