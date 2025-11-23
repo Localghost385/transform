@@ -38,17 +38,20 @@ def compute_reward_batch(step_probs, metrics_list, device):
     syncs = torch.tensor(syncs, device=device, dtype=torch.float32)
     ioi_vars = torch.tensor(ioi_vars, device=device, dtype=torch.float32)
 
-    weights = torch.stack([dense_fracs, syncs, ioi_vars], dim=1)
-    weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
-
+    # Feature normalization (min-max or scale to [0,1])
     features = torch.stack([
-        dense_fracs,
-        syncs,
+        dense_fracs / (dense_fracs.max() + 1e-6),
+        syncs / (syncs.max() + 1e-6),
         1.0 / (ioi_vars + 1e-6)
     ], dim=1)
+    features = features / (features.sum(dim=1, keepdim=True) + 1e-6)
 
-    rewards = (weights * features).sum(dim=1)
-    return rewards, weights
+    # Softmax to compute adaptive weights
+    adaptive_weights = torch.softmax(features, dim=1)
+
+    # Reward = weighted sum
+    rewards = (adaptive_weights * features).sum(dim=1)
+    return rewards, adaptive_weights
 
 
 # -------------------- Checkpointing --------------------
