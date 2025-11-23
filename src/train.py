@@ -21,16 +21,46 @@ def collate_fn(batch):
         "metrics": [d["metrics"] for d in batch]
     }
 
-# -------------------- RL Reward Computation --------------------
-def compute_reward(step_probs, metrics, device):
-    step_metrics = metrics['step']
-    dense_frac = torch.tensor(step_metrics['dense_frac'], device=device)
-    sync = torch.tensor(step_metrics['sync'], device=device)
-    ioi_var = torch.tensor(step_metrics['ioi_stats'][:, 1].mean(), device=device)
-    weights = torch.tensor([dense_frac, sync, ioi_var], device=device)
-    weights = weights / (weights.sum() + 1e-6)
-    reward = (weights * torch.tensor([dense_frac, sync, 1.0 / (ioi_var + 1e-6)], device=device)).sum()
-    return reward, weights
+# -------------------- Batched RL Reward --------------------
+def compute_reward_batch(step_probs, metrics_list, device):
+    """
+    step_probs: (B, T, D)
+    metrics_list: list of B dicts
+    Returns:
+        rewards: (B,)
+        adaptive_weights: (B, 3)
+    """
+
+    dense_fracs = []
+    syncs = []
+    ioi_vars = []
+
+    for m in metrics_list:
+        m_step = m['step']
+        dense_fracs.append(m_step['dense_frac'])
+        syncs.append(m_step['sync'])
+        ioi_vars.append(m_step['ioi_stats'][:, 1].mean())
+
+    # Convert to tensors
+    dense_fracs = torch.tensor(dense_fracs, device=device, dtype=torch.float32)
+    syncs = torch.tensor(syncs, device=device, dtype=torch.float32)
+    ioi_vars = torch.tensor(ioi_vars, device=device, dtype=torch.float32)
+
+    # Weights per sample
+    weights = torch.stack([dense_fracs, syncs, ioi_vars], dim=1)  # (B, 3)
+    weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
+
+    # Feature vector per sample
+    features = torch.stack([
+        dense_fracs,
+        syncs,
+        1.0 / (ioi_vars + 1e-6)
+    ], dim=1)  # (B, 3)
+
+    rewards = (weights * features).sum(dim=1)  # (B,)
+
+    return rewards, weights
+
 
 # -------------------- Checkpointing --------------------
 def save_checkpoint(model, optimizer, scheduler, epoch, path):
@@ -52,6 +82,7 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
         scheduler.load_state_dict(checkpoint['scheduler_state'])
     return checkpoint['epoch']
 
+
 # -------------------- Training Loop --------------------
 def train(rank, world_size, args):
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -61,12 +92,21 @@ def train(rank, world_size, args):
 
     # DDP initialization
     if world_size > 1:
-        dist.init_process_group(backend='nccl', rank=local_rank, world_size=world_size)
+        dist.init_process_group(
+            backend='nccl',
+            rank=local_rank,
+            world_size=world_size
+        )
         print(f"[Rank {local_rank}] DDP initialized with {world_size} GPUs")
 
     # Dataset & DataLoader
-    dataset = CompleteHierarchicalDrumDataset(args.data_dir, seq_len=args.seq_len, augment=args.augment)
+    dataset = CompleteHierarchicalDrumDataset(
+        args.data_dir,
+        seq_len=args.seq_len,
+        augment=args.augment
+    )
     sampler = DistributedSampler(dataset) if world_size > 1 else None
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -77,7 +117,7 @@ def train(rank, world_size, args):
         pin_memory=True
     )
 
-    # Dynamically get number of drums from dataset sample
+    # Get number of drums dynamically
     sample = dataset[0]
     num_drums = sample['step'].shape[-1]
 
@@ -92,15 +132,21 @@ def train(rank, world_size, args):
     ).to(device)
 
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True
+        )
         print(f"[Rank {local_rank}] Model wrapped in DDP")
 
-    # Optimizer, Scheduler, AMP
+    # Optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler() if device.type == "cuda" else None
 
     bce_loss = nn.BCEWithLogitsLoss()
+
     start_epoch = 0
     if args.resume:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume, device)
@@ -110,6 +156,7 @@ def train(rank, world_size, args):
     for epoch in range(start_epoch, args.epochs):
         if sampler:
             sampler.set_epoch(epoch)
+
         model.train()
         epoch_loss = 0.0
 
@@ -122,24 +169,33 @@ def train(rank, world_size, args):
             metrics_list = batch['metrics']
 
             optimizer.zero_grad()
+
             with torch.amp.autocast(device_type='cuda' if device.type=='cuda' else 'cpu'):
-                # Model returns logits, no sigmoid
+                # Forward pass (logits only)
                 step_logits, bar_logits, phrase_logits = model(step, bar, phrase)
 
                 loss_step = bce_loss(step_logits, step)
                 loss_bar = bce_loss(bar_logits, bar) if bar_logits is not None else 0.0
                 loss_phrase = bce_loss(phrase_logits, phrase) if phrase_logits is not None else 0.0
+
                 supervised_loss = loss_step + loss_bar + loss_phrase
 
+                # RL loss (batched)
                 rl_loss = 0.0
                 adaptive_weights = None
+
                 if args.rl_enabled:
-                    step_probs = torch.sigmoid(step_logits)  # only for RL reward
-                    reward, adaptive_weights = compute_reward(step_probs, metrics_list[0], device)
-                    rl_loss = -args.rl_weight * reward
+                    step_probs = torch.sigmoid(step_logits)
+
+                    with torch.no_grad():
+                        rewards, adaptive_weights = compute_reward_batch(
+                            step_probs, metrics_list, device
+                        )
+                    rl_loss = -args.rl_weight * rewards.mean()
 
                 total_loss = supervised_loss + rl_loss
 
+            # Backprop
             if scaler:
                 scaler.scale(total_loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -153,17 +209,28 @@ def train(rank, world_size, args):
             epoch_loss += total_loss.item()
 
         scheduler.step()
+
         if local_rank == 0:
             avg_loss = epoch_loss / len(dataloader)
             msg = f"Epoch {epoch}: loss={avg_loss:.6f}"
+
+            # Log batch-mean adaptive weights
             if adaptive_weights is not None:
-                msg += f", adaptive_weights={adaptive_weights.cpu().numpy()}"
+                msg += f", adaptive_weights_mean={adaptive_weights.mean(dim=0).cpu().numpy()}"
+
             print(msg)
-            save_checkpoint(model, optimizer, scheduler, epoch, os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt"))
+            save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt")
+            )
 
     if world_size > 1:
         dist.destroy_process_group()
         print(f"[Rank {local_rank}] DDP process group destroyed")
+
 
 # -------------------- CLI --------------------
 def parse_args():
@@ -193,5 +260,5 @@ if __name__ == "__main__":
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     world_size = args.num_gpus
 
-    # Train (Kaggle / single node DDP)
+    # Single-node (Kaggle) – user can switch to torchrun later
     train(0, world_size, args)
