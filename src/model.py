@@ -133,10 +133,9 @@ class HierarchicalDrumModel(nn.Module):
             phrase_out.repeat_interleave(4*16, dim=1)[:, :seq_len, :]
         ], dim=-1)
         step_combined = self.dropout_layer(step_combined)
-        step_preds = self.activation(self.step_output(step_combined))
-
-        bar_preds = self.activation(self.bar_output(bar_out))
-        phrase_preds = self.activation(self.phrase_output(phrase_out))
+        step_preds = self.step_output(step_combined)
+        bar_preds = self.bar_output(bar_out)
+        phrase_preds = self.phrase_output(phrase_out)
 
         return step_preds, bar_preds, phrase_preds
 

@@ -100,7 +100,7 @@ def train(rank, world_size, args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler() if device.type == "cuda" else None
 
-    bce_loss = nn.BCELoss()
+    bce_loss = nn.BCEWithLogitsLoss()
     start_epoch = 0
     if args.resume:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume, device)
