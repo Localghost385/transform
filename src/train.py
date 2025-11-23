@@ -57,12 +57,16 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
 # -------------------- Training Loop --------------------
 def train(rank, world_size, args):
     # -------------------- Device & DDP Setup --------------------
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+
     if world_size > 1:
-        dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
-        device = torch.device(f'cuda:{rank}')
+        dist.init_process_group(backend='nccl', rank=local_rank, world_size=world_size)
+        print(f"[Rank {local_rank}] DDP initialized with {world_size} GPUs")
     else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print("[DEBUG] Single GPU or CPU mode")
 
     # -------------------- Dataset & DataLoader --------------------
     dataset = CompleteHierarchicalDrumDataset(args.data_dir, seq_len=args.seq_len, augment=args.augment)
@@ -87,27 +91,28 @@ def train(rank, world_size, args):
     ).to(device)
 
     if world_size > 1:
-        model = DDP(model, device_ids=[rank])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+        print(f"[Rank {local_rank}] Model wrapped in DDP")
 
     # -------------------- Optimizer, Scheduler & AMP --------------------
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler(device_type='cuda' if device.type == 'cuda' else 'cpu')
 
     bce_loss = nn.BCELoss()
     start_epoch = 0
     if args.resume is not None:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume, device)
-        print(f"[Rank {rank}] Resumed from epoch {start_epoch}")
+        print(f"[Rank {local_rank}] Resumed from epoch {start_epoch}")
 
-    # -------------------- Training --------------------
+    # -------------------- Training Loop --------------------
     for epoch in range(start_epoch, args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Rank {rank}]") if rank == 0 else dataloader
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Rank {local_rank}]") if local_rank == 0 else dataloader
 
         for batch in pbar:
             step = batch['step'].to(device)
@@ -138,17 +143,17 @@ def train(rank, world_size, args):
             epoch_loss += total_loss.item()
 
         scheduler.step()
-        if rank == 0:
+        if local_rank == 0:
             avg_loss = epoch_loss / len(dataloader)
             msg = f"Epoch {epoch}: loss={avg_loss:.6f}"
             if adaptive_weights is not None:
                 msg += f", adaptive_weights={adaptive_weights.cpu().numpy()}"
             print(msg)
-            # Save checkpoint
             save_checkpoint(model, optimizer, scheduler, epoch, os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pt"))
 
     if world_size > 1:
         dist.destroy_process_group()
+        print(f"[Rank {local_rank}] DDP process group destroyed")
 
 # -------------------- CLI --------------------
 def parse_args():
