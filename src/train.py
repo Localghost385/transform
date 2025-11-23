@@ -9,28 +9,21 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-from dataset import CompleteHierarchicalDrumDataset
+from dataset import CachedHierarchicalDrumDataset  # <-- updated import
 from model import HierarchicalDrumModel
 
 # -------------------- Collate Function --------------------
 def collate_fn(batch):
+    # Cached dataset already returns torch tensors
     return {
-        "step": nn.utils.rnn.pad_sequence([d["step"] for d in batch], batch_first=True),
-        "bar": nn.utils.rnn.pad_sequence([d["bar"] for d in batch], batch_first=True),
-        "phrase": nn.utils.rnn.pad_sequence([d["phrase"] for d in batch], batch_first=True),
+        "step": torch.stack([d["step"] for d in batch]),
+        "bar": torch.stack([d["bar"] for d in batch]),
+        "phrase": torch.stack([d["phrase"] for d in batch]),
         "metrics": [d["metrics"] for d in batch]
     }
 
 # -------------------- Batched RL Reward --------------------
 def compute_reward_batch(step_probs, metrics_list, device):
-    """
-    step_probs: (B, T, D)
-    metrics_list: list of B dicts
-    Returns:
-        rewards: (B,)
-        adaptive_weights: (B, 3)
-    """
-
     dense_fracs = []
     syncs = []
     ioi_vars = []
@@ -41,24 +34,20 @@ def compute_reward_batch(step_probs, metrics_list, device):
         syncs.append(m_step['sync'])
         ioi_vars.append(m_step['ioi_stats'][:, 1].mean())
 
-    # Convert to tensors
     dense_fracs = torch.tensor(dense_fracs, device=device, dtype=torch.float32)
     syncs = torch.tensor(syncs, device=device, dtype=torch.float32)
     ioi_vars = torch.tensor(ioi_vars, device=device, dtype=torch.float32)
 
-    # Weights per sample
-    weights = torch.stack([dense_fracs, syncs, ioi_vars], dim=1)  # (B, 3)
+    weights = torch.stack([dense_fracs, syncs, ioi_vars], dim=1)
     weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
 
-    # Feature vector per sample
     features = torch.stack([
         dense_fracs,
         syncs,
         1.0 / (ioi_vars + 1e-6)
-    ], dim=1)  # (B, 3)
+    ], dim=1)
 
-    rewards = (weights * features).sum(dim=1)  # (B,)
-
+    rewards = (weights * features).sum(dim=1)
     return rewards, weights
 
 
@@ -99,8 +88,8 @@ def train(rank, world_size, args):
         )
         print(f"[Rank {local_rank}] DDP initialized with {world_size} GPUs")
 
-    # Dataset & DataLoader
-    dataset = CompleteHierarchicalDrumDataset(
+    # -------------------- Dataset & DataLoader --------------------
+    dataset = CachedHierarchicalDrumDataset(
         args.data_dir,
         seq_len=args.seq_len,
         augment=args.augment
@@ -121,7 +110,7 @@ def train(rank, world_size, args):
     sample = dataset[0]
     num_drums = sample['step'].shape[-1]
 
-    # Model
+    # -------------------- Model --------------------
     model = HierarchicalDrumModel(
         num_drums=num_drums,
         step_hidden_dim=args.d_model,
@@ -140,19 +129,19 @@ def train(rank, world_size, args):
         )
         print(f"[Rank {local_rank}] Model wrapped in DDP")
 
-    # Optimizer and scheduler
+    # -------------------- Optimizer & Scheduler --------------------
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler() if device.type == "cuda" else None
 
     bce_loss = nn.BCEWithLogitsLoss()
-
     start_epoch = 0
+
     if args.resume:
         start_epoch = load_checkpoint(model, optimizer, scheduler, args.resume, device)
         print(f"[Rank {local_rank}] Resumed from epoch {start_epoch}")
 
-    # Training
+    # -------------------- Training Loop --------------------
     for epoch in range(start_epoch, args.epochs):
         if sampler:
             sampler.set_epoch(epoch)
@@ -171,7 +160,6 @@ def train(rank, world_size, args):
             optimizer.zero_grad()
 
             with torch.amp.autocast(device_type='cuda' if device.type=='cuda' else 'cpu'):
-                # Forward pass (logits only)
                 step_logits, bar_logits, phrase_logits = model(step, bar, phrase)
 
                 loss_step = bce_loss(step_logits, step)
@@ -180,22 +168,18 @@ def train(rank, world_size, args):
 
                 supervised_loss = loss_step + loss_bar + loss_phrase
 
-                # RL loss (batched)
                 rl_loss = 0.0
                 adaptive_weights = None
 
                 if args.rl_enabled:
                     step_probs = torch.sigmoid(step_logits)
-
                     with torch.no_grad():
-                        rewards, adaptive_weights = compute_reward_batch(
-                            step_probs, metrics_list, device
-                        )
+                        rewards, adaptive_weights = compute_reward_batch(step_probs, metrics_list, device)
                     rl_loss = -args.rl_weight * rewards.mean()
 
                 total_loss = supervised_loss + rl_loss
 
-            # Backprop
+            # -------------------- Backprop --------------------
             if scaler:
                 scaler.scale(total_loss).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -213,12 +197,10 @@ def train(rank, world_size, args):
         if local_rank == 0:
             avg_loss = epoch_loss / len(dataloader)
             msg = f"Epoch {epoch}: loss={avg_loss:.6f}"
-
-            # Log batch-mean adaptive weights
             if adaptive_weights is not None:
                 msg += f", adaptive_weights_mean={adaptive_weights.mean(dim=0).cpu().numpy()}"
-
             print(msg)
+
             save_checkpoint(
                 model,
                 optimizer,
@@ -251,14 +233,13 @@ def parse_args():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--augment', action='store_true')
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=0)  # Cached dataset is memory-heavy
     return parser.parse_args()
+
 
 # -------------------- Main --------------------
 if __name__ == "__main__":
     args = parse_args()
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     world_size = args.num_gpus
-
-    # Single-node (Kaggle) – user can switch to torchrun later
     train(0, world_size, args)
