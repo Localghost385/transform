@@ -1,10 +1,10 @@
-# Technical Documentation: CompleteHierarchicalDrumDataset
+# Technical Documentation: CompleteHierarchicalDrumDataset with Optimized Training Integration
 
 ## Overview
 
 The ```CompleteHierarchicalDrumDataset``` is a fully hierarchical dataset designed for reinforcement learning (RL) and modeling of drum sequences. It supports **multi-level analysis** (step, bar, phrase, section, and song) with extensive metrics computation for rhythm structure, density, diversity, and temporal patterns.  
 
-The dataset can be integrated with PyTorch ```DataLoader``` for batched processing in RL training pipelines or generative models.
+The dataset can be integrated with PyTorch ```DataLoader``` for batched processing in RL training pipelines or generative models. It is fully compatible with **multi-GPU training** and **hyperparameter optimization** for automatic tuning of RL reward weights and other training parameters.
 
 ---
 
@@ -22,8 +22,7 @@ The dataset can be integrated with PyTorch ```DataLoader``` for batched processi
 
 ### Initialization
 
-```python
-CompleteHierarchicalDrumDataset(
+```CompleteHierarchicalDrumDataset(
     npz_dir,
     seq_len=512,
     steps_per_bar=16,
@@ -31,8 +30,7 @@ CompleteHierarchicalDrumDataset(
     sections=None,
     augment=False,
     fast_threshold=4
-)
-```
+)```
 
 **Parameters:**
 - ```npz_dir``` – directory containing .npz sequences
@@ -80,7 +78,7 @@ The dataset aggregates sequences at multiple hierarchical levels:
 
 Aggregation is handled using ```_aggregate(seq, step_size)```:
 
-```python
+```text
 num_units = seq.shape[0] // step_size
 aggregated = seq[:num_units*step_size].reshape(num_units, step_size, -1).mean(axis=1)
 ```
@@ -89,17 +87,18 @@ aggregated = seq[:num_units*step_size].reshape(num_units, step_size, -1).mean(ax
 
 ## Metrics Computed
 
-The dataset computes a **wide range of metrics** at each hierarchy level.
+The dataset computes a **wide range of metrics** at each hierarchy level, optimized for RL reward shaping.
 
 ### 1. Hit Density
 
-```python
+```text
 def _hit_density(seq):
     total_hits = seq.sum(axis=1)
     avg_hits = total_hits.mean()
     drum_density = seq.mean(axis=0)
     max_hits = total_hits.max()
 ```
+
 - **avg_hits:** average number of hits per step
 - **drum_density:** fraction of hits per drum
 - **max_hits:** max simultaneous hits in a step
@@ -108,9 +107,10 @@ def _hit_density(seq):
 
 ### 2. Fraction of Dense Bars
 
-```python
+```text
 def _fraction_dense_bars(seq, threshold=None)
 ```
+
 - Fraction of bars with hits above a threshold
 - Default: half of number of drums
 
@@ -118,9 +118,10 @@ def _fraction_dense_bars(seq, threshold=None)
 
 ### 3. Inter-Onset Interval (IOI) Statistics
 
-```python
+```text
 def _ioi_stats(seq)
 ```
+
 - Computes **mean**, **variance**, and **histogram** of intervals between hits per drum
 - Useful for analyzing rhythmic motifs and spacing patterns
 
@@ -128,9 +129,10 @@ def _ioi_stats(seq)
 
 ### 4. Co-occurrence
 
-```python
+```text
 def _co_occurrence(seq)
 ```
+
 - Fraction of steps where more than one drum plays simultaneously
 - Captures polyphonic density
 
@@ -138,9 +140,10 @@ def _co_occurrence(seq)
 
 ### 5. N-grams
 
-```python
+```text
 def _n_grams(seq, n=4)
 ```
+
 - Extracts n-step drum patterns (flattened across drums)
 - Returns a ```Counter``` for pattern frequency analysis
 - Supports diversity analysis at phrase/song level
@@ -149,9 +152,10 @@ def _n_grams(seq, n=4)
 
 ### 6. Fast Patterns
 
-```python
+```text
 def _fast_patterns(seq)
 ```
+
 - Counts number of hits separated by ≤ ```fast_threshold``` steps
 - Measures rhythmic intensity
 
@@ -159,9 +163,10 @@ def _fast_patterns(seq)
 
 ### 7. Transitions
 
-```python
+```text
 def _transitions(seq)
 ```
+
 - Computes **drum-to-drum conditional probability matrix** between consecutive steps
 - Useful for capturing sequential structure
 
@@ -169,9 +174,10 @@ def _transitions(seq)
 
 ### 8. Syncopation
 
-```python
+```text
 def _syncopation(seq)
 ```
+
 - Fraction of hits on **weak beats** (not downbeat)
 - Weak beats are determined by modulo operation with ```steps_per_bar```
 
@@ -179,9 +185,10 @@ def _syncopation(seq)
 
 ### 9. Phrase Structure
 
-```python
+```text
 def _phrase_structure(seq)
 ```
+
 - Returns number of hits per bar in a phrase
 - Ensures short sequences are handled safely
 
@@ -189,9 +196,10 @@ def _phrase_structure(seq)
 
 ### 10. Section Metrics
 
-```python
+```text
 def _section_metrics(seq)
 ```
+
 - Aggregates metrics for predefined sections
 - Returns dictionary with:
   - avg_hits
@@ -203,9 +211,10 @@ def _section_metrics(seq)
 
 ### 11. Song Metrics
 
-```python
+```text
 def _song_metrics(seq)
 ```
+
 - Aggregates metrics across the entire sequence:
   - avg_hits
   - drum_density
@@ -216,11 +225,11 @@ def _song_metrics(seq)
 
 ---
 
-## ```__getitem__``` Output
+## __getitem__ Output
 
 Each sample from the dataset returns a dictionary:
 
-```python
+```text
 {
     "step": torch.Tensor,   # [seq_len, num_drums]
     "bar": torch.Tensor,    # [num_bars, num_drums]
@@ -242,7 +251,7 @@ Each sample from the dataset returns a dictionary:
 
 ## DataLoader Integration
 
-```python
+```text
 get_complete_rl_dataloader(
     npz_dir,
     seq_len=512,
@@ -260,23 +269,41 @@ get_complete_rl_dataloader(
 - Returns dictionary with:
   - ```"step"```, ```"bar"```, ```"phrase"``` tensors ```[batch, seq_len, num_drums]```
   - ```"metrics"``` – list of per-sample metric dictionaries
+- Fully compatible with **single-node multi-GPU (```nn.DataParallel```) and DDP (```DistributedDataParallel```)**
+
+---
+
+## Optimizations for Training
+
+1. **Mixed-Precision Training:** ```torch.cuda.amp.autocast()``` and ```GradScaler``` to reduce memory and increase throughput.
+2. **Gradient Clipping:** prevents exploding gradients for long sequences.
+3. **Multi-GPU / DDP Support:** automatic data distribution and gradient synchronization for large-scale training.
+4. **Checkpointing & Resume:** save model, optimizer, and scheduler states for reproducibility.
+5. **RL Reward Shaping:** supports hierarchical metrics and composite reward functions.
+6. **Dynamic Hyperparameter Optimization:**
+   - Use frameworks like ```Optuna``` or ```Ray Tune```.
+   - Tune ```RL_weight```, learning rate, dropout, hidden dimensions automatically.
+   - Optionally treat reward weights as **trainable parameters** updated along with model.
+7. **Reward Normalization:** stabilize RL training by normalizing per-batch or per-epoch metric values.
+8. **Early Pruning:** stop trials or gradient updates that are unlikely to improve performance.
 
 ---
 
 ## Design Considerations
 
-1. **Hierarchical modeling** – step → bar → phrase → section → song
-2. **Multi-level metrics** – allows RL reward shaping at different levels
-3. **Flexible augmentation** – optional sequence shifts
-4. **Efficient indexing** – precomputes all sample start indices
-5. **Robust to short sequences** – handles sequences shorter than a bar/phrase
-6. **Extensible metrics** – easy to add new statistics (e.g., swing, polyrhythm)
+- **Hierarchical modeling** – step → bar → phrase → section → song
+- **Multi-level metrics** – allows RL reward shaping at different levels
+- **Flexible augmentation** – optional sequence shifts
+- **Efficient indexing** – precomputes all sample start indices
+- **Robust to short sequences** – handles sequences shorter than a bar/phrase
+- **Extensible metrics** – easy to add new statistics (e.g., swing, polyrhythm)
+- **DDP-Compatible** – designed for multi-node or multi-GPU distributed training
 
 ---
 
 ## Example Usage
 
-```python
+```text
 from your_module import get_complete_rl_dataloader
 
 npz_dir = "./train/"
@@ -300,6 +327,8 @@ for batch in dataloader:
   - Padding correctness for variable-length sequences
 - **Integration tests**:
   - Verify hierarchical metrics are consistent across levels
+  - Test multi-GPU training and DDP synchronization
+  - Validate reward normalization and RL weighting adjustments
 
 ---
 
@@ -311,8 +340,10 @@ The ```CompleteHierarchicalDrumDataset``` provides a **robust, multi-level frame
 - Rich, interpretable metrics
 - Augmentation support
 - Easy integration with PyTorch for RL and generative tasks
+- Fully compatible with **optimized multi-GPU and DDP training**
+- Supports **automated hyperparameter optimization** for reward shaping and training stability
 
-This makes it ideal for:
+Ideal for:
 
 - Reinforcement learning on symbolic drums
 - Rhythm pattern analysis

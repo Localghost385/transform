@@ -1,162 +1,185 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Tuple
 
-class DrumTransformer(nn.Module):
+# -------------------- Hierarchical Drum Model --------------------
+class HierarchicalDrumModel(nn.Module):
     """
-    Decoder-only Transformer (GPT-style) for drum pattern generation.
-    Input: multi-hot vectors of drum hits (T, D)
-    Output: probabilities for each drum class (T, D)
+    Hierarchical drum model supporting step, bar, and phrase levels.
+    Can use RNNs (default GRU) or Transformer encoders.
     """
+
     def __init__(
         self,
-        num_classes: int = 23,      # D
-        seq_len: int = 512,         # context window
-        d_model: int = 512,
-        nhead: int = 8,
-        num_layers: int = 8,
-        dim_feedforward: int = 2048,
-        dropout: float = 0.1
+        num_drums: int,
+        step_hidden_dim: int = 128,
+        bar_hidden_dim: int = 128,
+        phrase_hidden_dim: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        use_transformer: bool = False,
     ):
         super().__init__()
-        self.num_classes = num_classes
-        self.seq_len = seq_len
-        self.d_model = d_model
+        self.num_drums = num_drums
+        self.step_hidden_dim = step_hidden_dim
+        self.bar_hidden_dim = bar_hidden_dim
+        self.phrase_hidden_dim = phrase_hidden_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.use_transformer = use_transformer
 
-        # Input embedding: project multi-hot drum vector -> d_model
-        self.input_proj = nn.Linear(num_classes, d_model)
-
-        # Learned positional embeddings
-        self.pos_embed = nn.Embedding(seq_len, d_model)
-
-        # Transformer decoder layers
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu"
-        )
-        self.transformer = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=num_layers
-        )
-
-        # Output projection
-        self.output_proj = nn.Linear(d_model, num_classes)
-
-    def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape (B, T, D) -> multi-hot drum sequence
-        Returns:
-            out: Tensor of shape (B, T, D) -> probabilities for each drum class
-        """
-        B, T, D = x.shape
-        device = x.device
-        assert D == self.num_classes, f"Input D={D}, expected {self.num_classes}"
-
-        # Input projection
-        x = self.input_proj(x) * (self.d_model ** 0.5)  # (B, T, d_model)
-
-        # Positional embeddings
-        pos_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
-        x = x + self.pos_embed(pos_ids)
-
-        # Transformer expects (T, B, d_model)
-        x = x.transpose(0, 1)  # (T, B, d_model)
-
-        # Causal mask for autoregressive prediction
-        mask = nn.Transformer.generate_square_subsequent_mask(T).to(device)  # (T, T)
-
-        # Pass through transformer decoder
-        out = self.transformer(x, x, tgt_mask=mask)  # (T, B, d_model)
-
-        # Back to (B, T, d_model)
-        out = out.transpose(0, 1)
-
-        # Output projection + sigmoid for multi-label
-        out = torch.sigmoid(self.output_proj(out))  # (B, T, D)
-        return out
-
-    def compute_loss(self, preds, targets):
-        """
-        Binary Cross-Entropy loss over all drum classes per time step.
-        Args:
-            preds: (B, T, D) - probabilities
-            targets: (B, T, D) - multi-hot ground truth
-        Returns:
-            loss: scalar
-        """
-        return F.binary_cross_entropy(preds, targets)
-
-    def count_parameters(self):
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    def save(self, path):
-        torch.save(self.state_dict(), path)
-
-    def load(self, path, map_location=None, strict=False, print_missing=True):
-        """
-        Robustly load a checkpoint or bare state_dict.
-
-        - If path points to a training checkpoint (dict with "model_state_dict"), that is extracted.
-        - Removes "module." prefixes (from DataParallel / DDP) automatically.
-        - Calls load_state_dict(..., strict=strict).
-        - If print_missing=True, prints missing/unexpected keys summary.
-        """
-        ckpt = torch.load(path, map_location=map_location)
-
-        # If it's a training checkpoint, extract model_state_dict
-        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-        elif isinstance(ckpt, dict) and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
-            # probably already a raw state_dict
-            state_dict = ckpt
+        # Step-level encoder
+        if use_transformer:
+            self.step_rnn = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=step_hidden_dim, nhead=4, dim_feedforward=step_hidden_dim*4, dropout=dropout
+                ),
+                num_layers=num_layers
+            )
         else:
-            state_dict = ckpt
+            self.step_rnn = nn.GRU(num_drums, step_hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout)
 
-        # Remove 'module.' prefix if present (from DataParallel / DDP)
-        new_state = {}
-        for k, v in state_dict.items():
-            new_k = k
-            if k.startswith("module."):
-                new_k = k[len("module."):]
-            new_state[new_k] = v
+        # Linear projection from step to bar
+        self.step_to_bar = nn.Linear(step_hidden_dim, bar_hidden_dim)
 
-        # Try to load
-        missing_keys, unexpected_keys = self.load_state_dict(new_state, strict=strict)
+        # Bar-level encoder
+        if use_transformer:
+            self.bar_rnn = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=bar_hidden_dim, nhead=4, dim_feedforward=bar_hidden_dim*4, dropout=dropout
+                ),
+                num_layers=num_layers
+            )
+        else:
+            self.bar_rnn = nn.GRU(bar_hidden_dim, bar_hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout)
 
-        # For modern torch versions load_state_dict returns NamedTuple with missing/unexpected.
-        # If it returned None (older style) we can attempt to deduce nothing further here.
-        try:
-            missing = missing_keys.missing_keys
-            unexpected = missing_keys.unexpected_keys
-        except Exception:
-            # Fallback for older torch - ignore
-            missing = None
-            unexpected = None
+        # Linear projection from bar to phrase
+        self.bar_to_phrase = nn.Linear(bar_hidden_dim, phrase_hidden_dim)
 
-        if print_missing:
-            if missing is not None:
-                if len(missing) > 0:
-                    print("[LOAD] Missing keys:", missing)
-                else:
-                    print("[LOAD] No missing keys.")
-            if unexpected is not None:
-                if len(unexpected) > 0:
-                    print("[LOAD] Unexpected keys:", unexpected)
-                else:
-                    print("[LOAD] No unexpected keys.")
+        # Phrase-level encoder
+        if use_transformer:
+            self.phrase_rnn = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=phrase_hidden_dim, nhead=4, dim_feedforward=phrase_hidden_dim*4, dropout=dropout
+                ),
+                num_layers=num_layers
+            )
+        else:
+            self.phrase_rnn = nn.GRU(phrase_hidden_dim, phrase_hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout)
 
-        return missing, unexpected
+        # Final step output layer
+        self.output_layer = nn.Linear(step_hidden_dim + bar_hidden_dim + phrase_hidden_dim, num_drums)
+        self.activation = nn.Sigmoid()
+        self.dropout_layer = nn.Dropout(dropout)
 
+    # -------------------- Forward --------------------
+    def forward(
+        self,
+        step_seq: torch.Tensor,
+        bar_seq: Optional[torch.Tensor] = None,
+        phrase_seq: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        step_seq: [batch, seq_len, num_drums]
+        bar_seq: [batch, num_bars, num_drums] optional (used if aggregation is skipped)
+        phrase_seq: [batch, num_phrases, num_drums] optional
+        Returns:
+            step_preds: [batch, seq_len, num_drums]
+            bar_preds: [batch, num_bars, num_drums] (optional)
+            phrase_preds: [batch, num_phrases, num_drums] (optional)
+        """
+        batch_size, seq_len, D = step_seq.shape
 
+        # Step-level encoding
+        if self.use_transformer:
+            # Transformer expects [seq_len, batch, d_model], project first
+            step_embed = F.linear(step_seq, torch.eye(D, self.step_hidden_dim, device=step_seq.device))
+            step_out = self.step_rnn(step_embed.transpose(0,1)).transpose(0,1)
+        else:
+            step_out, _ = self.step_rnn(step_seq)  # [batch, seq_len, step_hidden_dim]
 
-if __name__ == "__main__":
-    # Quick sanity check
-    model = DrumTransformer(num_classes=23, seq_len=512)
-    x = torch.randint(0, 2, (2, 512, 23)).float()  # batch_size=2
-    out = model(x)
-    print("Output shape:", out.shape)
-    print("Number of trainable parameters:", model.count_parameters())
+        # Aggregate step -> bar
+        num_bars = step_out.shape[1] // 16
+        step_trim = step_out[:, :num_bars*16, :]  # trim to full bars
+        step_bar = step_trim.reshape(batch_size, num_bars, 16, self.step_hidden_dim).mean(dim=2)
+        bar_in = self.step_to_bar(step_bar)
+        # Bar-level encoding
+        if self.use_transformer:
+            bar_out = self.bar_rnn(bar_in.transpose(0,1)).transpose(0,1)
+        else:
+            bar_out, _ = self.bar_rnn(bar_in)
+
+        # Aggregate bar -> phrase
+        num_phrases = bar_out.shape[1] // 4
+        bar_trim = bar_out[:, :num_phrases*4, :]
+        bar_phrase = bar_trim.reshape(batch_size, num_phrases, 4, self.bar_hidden_dim).mean(dim=2)
+        phrase_in = self.bar_to_phrase(bar_phrase)
+        # Phrase-level encoding
+        if self.use_transformer:
+            phrase_out = self.phrase_rnn(phrase_in.transpose(0,1)).transpose(0,1)
+        else:
+            phrase_out, _ = self.phrase_rnn(phrase_in)
+
+        # Broadcast bar and phrase embeddings back to step-level
+        bar_broadcast = bar_out.repeat_interleave(16, dim=1)
+        phrase_broadcast = phrase_out.repeat_interleave(4*16, dim=1)  # 4 bars per phrase
+
+        # Trim to match seq_len
+        bar_broadcast = bar_broadcast[:, :seq_len, :]
+        phrase_broadcast = phrase_broadcast[:, :seq_len, :]
+
+        # Concatenate embeddings and predict
+        combined = torch.cat([step_out, bar_broadcast, phrase_broadcast], dim=-1)
+        combined = self.dropout_layer(combined)
+        step_preds = self.output_layer(combined)  # logits
+        step_probs = self.activation(step_preds)
+
+        # Optional outputs at higher levels
+        bar_preds = self.activation(bar_out @ self.output_layer.weight.T)
+        phrase_preds = self.activation(phrase_out @ self.output_layer.weight.T)
+
+        return step_probs, bar_preds, phrase_preds
+
+    # -------------------- Loss --------------------
+    def compute_loss(
+        self,
+        step_preds: torch.Tensor,
+        step_targets: torch.Tensor,
+        bar_preds: Optional[torch.Tensor] = None,
+        bar_targets: Optional[torch.Tensor] = None,
+        phrase_preds: Optional[torch.Tensor] = None,
+        phrase_targets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute hierarchical BCE loss
+        """
+        loss = F.binary_cross_entropy(step_preds, step_targets)
+        if bar_preds is not None and bar_targets is not None:
+            loss += F.binary_cross_entropy(bar_preds, bar_targets)
+        if phrase_preds is not None and phrase_targets is not None:
+            loss += F.binary_cross_entropy(phrase_preds, phrase_targets)
+        return loss
+
+    # -------------------- Autoregressive generation --------------------
+    @torch.no_grad()
+    def generate(
+        self,
+        start_seq: torch.Tensor,
+        length: int = 512,
+        temperature: float = 1.0
+    ) -> torch.Tensor:
+        """
+        Autoregressive generation (step-level)
+        """
+        generated = [start_seq]
+        current_seq = start_seq.clone()
+        for _ in range(length):
+            step_pred, _, _ = self.forward(current_seq)
+            last_step = step_pred[:, -1, :]  # take last predicted step
+            prob = last_step / temperature
+            next_step = torch.bernoulli(prob)
+            generated.append(next_step)
+            current_seq = torch.cat([current_seq, next_step.unsqueeze(1)], dim=1)
+        return torch.cat(generated, dim=1)
+
