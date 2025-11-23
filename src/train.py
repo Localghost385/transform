@@ -22,7 +22,7 @@ def collate_fn(batch):
     }
 
 # -------------------- RL Reward Computation --------------------
-def compute_reward(logits, metrics, device):
+def compute_reward(step_probs, metrics, device):
     step_metrics = metrics['step']
     dense_frac = torch.tensor(step_metrics['dense_frac'], device=device)
     sync = torch.tensor(step_metrics['sync'], device=device)
@@ -92,7 +92,7 @@ def train(rank, world_size, args):
     ).to(device)
 
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         print(f"[Rank {local_rank}] Model wrapped in DDP")
 
     # Optimizer, Scheduler, AMP
@@ -123,16 +123,19 @@ def train(rank, world_size, args):
 
             optimizer.zero_grad()
             with torch.amp.autocast(device_type='cuda' if device.type=='cuda' else 'cpu'):
-                step_pred, bar_pred, phrase_pred = model(step, bar, phrase)
-                loss_step = bce_loss(step_pred, step)
-                loss_bar = bce_loss(bar_pred, bar) if bar_pred is not None else 0.0
-                loss_phrase = bce_loss(phrase_pred, phrase) if phrase_pred is not None else 0.0
+                # Model returns logits, no sigmoid
+                step_logits, bar_logits, phrase_logits = model(step, bar, phrase)
+
+                loss_step = bce_loss(step_logits, step)
+                loss_bar = bce_loss(bar_logits, bar) if bar_logits is not None else 0.0
+                loss_phrase = bce_loss(phrase_logits, phrase) if phrase_logits is not None else 0.0
                 supervised_loss = loss_step + loss_bar + loss_phrase
 
                 rl_loss = 0.0
                 adaptive_weights = None
                 if args.rl_enabled:
-                    reward, adaptive_weights = compute_reward(step_pred, metrics_list[0], device)
+                    step_probs = torch.sigmoid(step_logits)  # only for RL reward
+                    reward, adaptive_weights = compute_reward(step_probs, metrics_list[0], device)
                     rl_loss = -args.rl_weight * reward
 
                 total_loss = supervised_loss + rl_loss
