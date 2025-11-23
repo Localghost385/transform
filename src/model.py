@@ -82,12 +82,10 @@ class HierarchicalDrumModel(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         step_seq: [batch, seq_len, num_drums]
-        bar_seq: [batch, num_bars, num_drums] optional (used if aggregation is skipped)
-        phrase_seq: [batch, num_phrases, num_drums] optional
         Returns:
             step_preds: [batch, seq_len, num_drums]
-            bar_preds: [batch, num_bars, num_drums] (optional)
-            phrase_preds: [batch, num_phrases, num_drums] (optional)
+            bar_preds: [batch, num_bars, num_drums]
+            phrase_preds: [batch, num_phrases, num_drums]
         """
         batch_size, seq_len, D = step_seq.shape
 
@@ -104,6 +102,7 @@ class HierarchicalDrumModel(nn.Module):
         step_trim = step_out[:, :num_bars*16, :]  # trim to full bars
         step_bar = step_trim.reshape(batch_size, num_bars, 16, self.step_hidden_dim).mean(dim=2)
         bar_in = self.step_to_bar(step_bar)
+
         # Bar-level encoding
         if self.use_transformer:
             bar_out = self.bar_rnn(bar_in.transpose(0,1)).transpose(0,1)
@@ -115,31 +114,26 @@ class HierarchicalDrumModel(nn.Module):
         bar_trim = bar_out[:, :num_phrases*4, :]
         bar_phrase = bar_trim.reshape(batch_size, num_phrases, 4, self.bar_hidden_dim).mean(dim=2)
         phrase_in = self.bar_to_phrase(bar_phrase)
+
         # Phrase-level encoding
         if self.use_transformer:
             phrase_out = self.phrase_rnn(phrase_in.transpose(0,1)).transpose(0,1)
         else:
             phrase_out, _ = self.phrase_rnn(phrase_in)
 
-        # Broadcast bar and phrase embeddings back to step-level
-        bar_broadcast = bar_out.repeat_interleave(16, dim=1)
-        phrase_broadcast = phrase_out.repeat_interleave(4*16, dim=1)  # 4 bars per phrase
+        # -------------------- Predictions --------------------
+        step_combined = torch.cat([
+            step_out,
+            bar_out.repeat_interleave(16, dim=1)[:, :seq_len, :],
+            phrase_out.repeat_interleave(4*16, dim=1)[:, :seq_len, :]
+        ], dim=-1)
+        step_combined = self.dropout_layer(step_combined)
+        step_preds = self.activation(self.step_output(step_combined))
 
-        # Trim to match seq_len
-        bar_broadcast = bar_broadcast[:, :seq_len, :]
-        phrase_broadcast = phrase_broadcast[:, :seq_len, :]
+        bar_preds = self.activation(self.bar_output(bar_out))
+        phrase_preds = self.activation(self.phrase_output(phrase_out))
 
-        # Concatenate embeddings and predict
-        combined = torch.cat([step_out, bar_broadcast, phrase_broadcast], dim=-1)
-        combined = self.dropout_layer(combined)
-        step_preds = self.output_layer(combined)  # logits
-        step_probs = self.activation(step_preds)
-
-        # Optional outputs at higher levels
-        bar_preds = self.activation(bar_out @ self.output_layer.weight.T)
-        phrase_preds = self.activation(phrase_out @ self.output_layer.weight.T)
-
-        return step_probs, bar_preds, phrase_preds
+        return step_preds, bar_preds, phrase_preds
 
     # -------------------- Loss --------------------
     def compute_loss(
