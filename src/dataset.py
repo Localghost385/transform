@@ -3,21 +3,31 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from collections import Counter
 
 class CachedHierarchicalDrumDataset(Dataset):
     """
-    Fully cached hierarchical drum dataset.
+    Fully cached hierarchical drum dataset with file caching.
     Precomputes step/bar/phrase sequences and all metrics in memory.
+    Saves cache to disk to avoid recomputation.
     """
     def __init__(self, npz_dir, seq_len=512, steps_per_bar=16, bars_per_phrase=4,
-                 augment=False, fast_threshold=4, verbose=True):
+                 augment=False, fast_threshold=4, verbose=True, cache_file="dataset_cache.pt"):
         self.seq_len = seq_len
         self.steps_per_bar = steps_per_bar
         self.bars_per_phrase = bars_per_phrase
         self.phrase_len = steps_per_bar * bars_per_phrase
         self.augment = augment
         self.fast_threshold = fast_threshold
+        self.cache_file = os.path.join(npz_dir, cache_file)
+
+        # Load cache if available
+        if os.path.exists(self.cache_file):
+            if verbose:
+                print(f"Loading dataset cache from {self.cache_file}")
+            self.cache = torch.load(self.cache_file)
+            if verbose:
+                print(f"Loaded {len(self.cache)} samples from cache")
+            return
 
         # Load NPZ files
         files = [os.path.join(npz_dir, f) for f in os.listdir(npz_dir) if f.endswith('.npz')]
@@ -43,27 +53,27 @@ class CachedHierarchicalDrumDataset(Dataset):
                 bar_seq = self._aggregate(step_seq, steps_per_bar)
                 phrase_seq = self._aggregate(step_seq, self.phrase_len)
                 metrics = self.compute_all_metrics(step_seq, bar_seq, phrase_seq)
-                # Convert sequences to torch tensors and cache
                 self.cache.append({
                     "step": torch.from_numpy(step_seq).float(),
                     "bar": torch.from_numpy(bar_seq).float(),
                     "phrase": torch.from_numpy(phrase_seq).float(),
                     "metrics": metrics
                 })
+
+        # Save cache to file
+        torch.save(self.cache, self.cache_file)
         if verbose:
-            print(f"Cached {len(self.cache)} samples in memory.")
+            print(f"Cached {len(self.cache)} samples and saved to {self.cache_file}")
 
     def __len__(self):
         return len(self.cache)
 
     def __getitem__(self, idx):
         sample = self.cache[idx]
-        # Apply augmentation if enabled
         if self.augment:
             step = sample["step"]
             shift = np.random.randint(-2, 3)
             step = torch.roll(step, shifts=shift, dims=0)
-            # Recompute bar/phrase from shifted step
             bar = self._aggregate(step.numpy(), self.steps_per_bar)
             phrase = self._aggregate(step.numpy(), self.phrase_len)
             bar = torch.from_numpy(bar).float()
