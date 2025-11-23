@@ -97,7 +97,8 @@ def train(rank, world_size, args):
     # -------------------- Optimizer, Scheduler & AMP --------------------
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.amp.GradScaler(device_type='cuda' if device.type == 'cuda' else 'cpu')
+    scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
+
 
     bce_loss = nn.BCELoss()
     start_epoch = 0
