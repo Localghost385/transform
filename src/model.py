@@ -72,6 +72,11 @@ class HierarchicalDrumModel(nn.Module):
         self.output_layer = nn.Linear(step_hidden_dim + bar_hidden_dim + phrase_hidden_dim, num_drums)
         self.activation = nn.Sigmoid()
         self.dropout_layer = nn.Dropout(dropout)
+        # Output layers for each hierarchical level
+        self.step_output = nn.Linear(step_hidden_dim + bar_hidden_dim + phrase_hidden_dim, num_drums)
+        self.bar_output = nn.Linear(bar_hidden_dim, num_drums)
+        self.phrase_output = nn.Linear(phrase_hidden_dim, num_drums)
+
 
     # -------------------- Forward --------------------
     def forward(
