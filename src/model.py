@@ -84,27 +84,26 @@ class HierarchicalDrumModel(nn.Module):
         step_seq: torch.Tensor,
         bar_seq: Optional[torch.Tensor] = None,
         phrase_seq: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         step_seq: [batch, seq_len, num_drums]
         Returns:
             step_preds: [batch, seq_len, num_drums]
-            bar_preds: [batch, num_bars, num_drums]
-            phrase_preds: [batch, num_phrases, num_drums]
+            bar_preds: [batch, num_bars, num_drums]   # never None
+            phrase_preds: [batch, num_phrases, num_drums]  # never None
         """
         batch_size, seq_len, D = step_seq.shape
 
         # Step-level encoding
         if self.use_transformer:
-            # Transformer expects [seq_len, batch, d_model], project first
             step_embed = F.linear(step_seq, torch.eye(D, self.step_hidden_dim, device=step_seq.device))
             step_out = self.step_rnn(step_embed.transpose(0,1)).transpose(0,1)
         else:
-            step_out, _ = self.step_rnn(step_seq)  # [batch, seq_len, step_hidden_dim]
+            step_out, _ = self.step_rnn(step_seq)
 
         # Aggregate step -> bar
         num_bars = step_out.shape[1] // 16
-        step_trim = step_out[:, :num_bars*16, :]  # trim to full bars
+        step_trim = step_out[:, :num_bars*16, :]
         step_bar = step_trim.reshape(batch_size, num_bars, 16, self.step_hidden_dim).mean(dim=2)
         bar_in = self.step_to_bar(step_bar)
 
@@ -134,8 +133,10 @@ class HierarchicalDrumModel(nn.Module):
         ], dim=-1)
         step_combined = self.dropout_layer(step_combined)
         step_preds = self.step_output(step_combined)
-        bar_preds = self.bar_output(bar_out)
-        phrase_preds = self.phrase_output(phrase_out)
+
+        # Ensure bar_preds and phrase_preds are always tensors
+        bar_preds = self.bar_output(bar_out) if hasattr(self, 'bar_output') else torch.zeros(batch_size, num_bars, D, device=step_seq.device)
+        phrase_preds = self.phrase_output(phrase_out) if hasattr(self, 'phrase_output') else torch.zeros(batch_size, num_phrases, D, device=step_seq.device)
 
         return step_preds, bar_preds, phrase_preds
 
